@@ -28,7 +28,123 @@ const el = {
   zlabel: document.getElementById("zlabel"),
   zstate: document.getElementById("zstate"),
   ztarget: document.getElementById("ztarget"),
+  batchBox: document.getElementById("batchBox"),
+  batchText: document.getElementById("batchText"),
+  batchCount: document.getElementById("batchCount"),
+  batchStart: document.getElementById("batchStart"),
+  batchHint: document.getElementById("batchHint"),
+  batchList: document.getElementById("batchList"),
+  wvpnBase: document.getElementById("wvpnBase"),
 };
+
+/* ------------------------------------------------------------ 批量取件 */
+
+const DOI_RE = /10\.\d{4,9}\/[^\s"'<>,;]+/gi;
+const CJK_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]/;
+
+function parseDois(text) {
+  const found = [];
+  const seen = new Set();
+  for (const match of String(text || "").matchAll(DOI_RE)) {
+    const doi = match[0].replace(/[.,;)\]}>'"]+$/, "");
+    if (!doi || CJK_RE.test(doi)) continue;
+    const key = doi.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    found.push(doi);
+  }
+  return found;
+}
+
+const BATCH_LABEL = {
+  pending: "待处理",
+  working: "取件中",
+  challenge: "需人工验证",
+  downloaded: "已下载",
+  manual: "待手动",
+  failed: "失败",
+};
+
+const BATCH_CLASS = {
+  downloaded: "ok",
+  failed: "bad",
+  challenge: "warn",
+  manual: "warn",
+};
+
+function renderBatch(state) {
+  if (!el.batchList) return;
+  el.batchList.innerHTML = "";
+  if (!state || !(state.items || []).length) {
+    if (el.batchCount) el.batchCount.textContent = "";
+    return;
+  }
+  const done = state.items.filter((item) => item.status === "downloaded").length;
+  if (el.batchCount) {
+    el.batchCount.textContent = state.running
+      ? ` ${state.current + 1}/${state.items.length}`
+      : ` ${done}/${state.items.length} 完成`;
+  }
+  for (const item of state.items) {
+    const row = document.createElement("li");
+    const doi = document.createElement("span");
+    doi.className = "bdoi";
+    doi.textContent = item.doi;
+    doi.title = item.detail || item.doi;
+
+    const status = document.createElement("span");
+    status.className = "bst " + (BATCH_CLASS[item.status] || "");
+    status.textContent = BATCH_LABEL[item.status] || item.status;
+
+    row.append(doi, status);
+    el.batchList.appendChild(row);
+  }
+}
+
+async function refreshBatch() {
+  let state = null;
+  try {
+    state = await chrome.runtime.sendMessage({ type: "batch-state" });
+  } catch (err) {
+    state = null;
+  }
+  renderBatch(state);
+  if (el.batchBox && state && (state.running || (state.items || []).length)) {
+    el.batchBox.open = true;
+  }
+}
+
+async function startBatch() {
+  const dois = parseDois(el.batchText.value);
+  const base = (el.wvpnBase.value || "").trim().replace(/\/+$/, "");
+
+  if (!dois.length) {
+    el.batchHint.className = "bhint warn";
+    el.batchHint.textContent = "没识别到 DOI";
+    return;
+  }
+  if (base && !/^https?:\/\//i.test(base)) {
+    el.batchHint.className = "bhint warn";
+    el.batchHint.textContent = "网关地址要以 https:// 开头";
+    return;
+  }
+
+  await chrome.storage.local.set({ wvpnBase: base });
+  el.batchHint.className = "bhint";
+  el.batchHint.textContent = `开始处理 ${dois.length} 篇…（可以关掉面板，后台会继续）`;
+  el.batchStart.disabled = true;
+
+  try {
+    const reply = await chrome.runtime.sendMessage({ type: "batch-run", dois, base });
+    if (reply && reply.ok) renderBatch(reply.state);
+    else el.batchHint.textContent = "启动失败：" + ((reply && reply.error) || "未知原因");
+  } catch (err) {
+    el.batchHint.className = "bhint warn";
+    el.batchHint.textContent = "启动失败：" + (err && err.message);
+  } finally {
+    el.batchStart.disabled = false;
+  }
+}
 
 async function loadZoteroTargets() {
   let info = { ok: false, targets: [] };
@@ -599,6 +715,11 @@ async function startDownload() {
 chrome.runtime.onMessage.addListener((message) => {
   if (!message || message.type !== "progress") return;
 
+  if (message.batch) {
+    renderBatch(message.batch);
+    return;
+  }
+
   if (message.zotero) {
     renderZotero(message.zotero);
     if (state.job) state.job.zotero = message.zotero;
@@ -652,6 +773,21 @@ chrome.runtime.onMessage.addListener((message) => {
 
   el.pick.addEventListener("click", chooseFolder);
   el.start.addEventListener("click", startDownload);
+
+  // 批量取件
+  el.batchStart.addEventListener("click", startBatch);
+  el.batchText.addEventListener("input", () => {
+    const count = parseDois(el.batchText.value).length;
+    el.batchHint.className = "bhint";
+    el.batchHint.textContent = count ? `识别到 ${count} 个 DOI` : "";
+  });
+  try {
+    const saved = await chrome.storage.local.get("wvpnBase");
+    if (saved && saved.wvpnBase) el.wvpnBase.value = saved.wvpnBase;
+  } catch (err) {
+    /* ignore */
+  }
+  refreshBatch();
 
   // 未检测到时，「重试」字样可点（在 label 里，要阻止它连带切换勾选）
   el.zstate.addEventListener("click", (event) => {

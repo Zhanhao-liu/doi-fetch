@@ -37,3 +37,7 @@ _build/
 _batch_test/
 pytest-of-*/
 
+_ext_batch/
+
+# 生成的个人清单
+待补清单.html

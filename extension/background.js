@@ -1,6 +1,8 @@
 // DOI 取件器 · 后台
 // 除了路由下载，还负责把任务状态写进 storage.local —— 面板关掉再打开能接着看。
 
+importScripts("webvpn.js");
+
 const OFFSCREEN_PATH = "offscreen.html";
 const JOB_KEY = "activeJob";
 const RECENT_KEY = "recentJobs";
@@ -550,10 +552,216 @@ async function runDownloads(job) {
   });
 }
 
+/* ------------------------------------------------------------ 批量队列 */
+
+const BATCH_KEY = "batchState";
+const BATCH_ROOT = "DOI取件器/批量";
+const BATCH_TIMEOUT_MS = 4 * 60 * 1000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function doiSlug(doi) {
+  return (doi || "").replace(/[^0-9a-zA-Z._-]+/g, "-").slice(0, 80) || "item";
+}
+
+/* 注入到论文页里，只读取、不修改 */
+function sniffPage() {
+  const meta = document.querySelector('meta[name="citation_pdf_url"]');
+  const anchors = Array.from(document.querySelectorAll("a[href]"))
+    .map((anchor) => anchor.href)
+    .filter((href) => /\/pdfft|\.pdf(\?|$)|\/pdf(\?|$)/i.test(href));
+  return {
+    title: document.title,
+    ready: document.readyState,
+    meta: meta ? meta.content : "",
+    links: anchors.slice(0, 5),
+    url: location.href,
+  };
+}
+
+async function readBatch() {
+  const data = await chrome.storage.local.get(BATCH_KEY);
+  return data[BATCH_KEY] || null;
+}
+
+async function writeBatch(state) {
+  try {
+    await chrome.storage.local.set({ [BATCH_KEY]: state });
+  } catch (err) {
+    /* ignore */
+  }
+  report({ batch: state });
+  return state;
+}
+
+/** PDF 若是绝对地址且启用了网关，就改写回网关形式，避免绕开校内会话 */
+function pickPdfUrl(info, base) {
+  const candidates = [info.meta, ...(info.links || [])].filter(Boolean);
+  for (const raw of candidates) {
+    let url = String(raw).trim();
+    if (!url) continue;
+    if (base && /^https?:\/\//i.test(url) && !url.startsWith(base)) {
+      url = DOIWebVPN.convert(url, base);
+    }
+    return url;
+  }
+  return "";
+}
+
+function notifyBatch(text) {
+  try {
+    chrome.notifications.create("", {
+      type: "basic",
+      iconUrl: "icon128.png",
+      title: "DOI 取件器 · 批量",
+      message: String(text).slice(0, 200),
+    });
+  } catch (err) {
+    /* 通知失败不影响流程 */
+  }
+}
+
+async function runBatch(dois, base) {
+  const state = {
+    id: "b" + Date.now().toString(36),
+    base: base || "",
+    root: BATCH_ROOT,
+    running: true,
+    startedAt: Date.now(),
+    finishedAt: 0,
+    current: 0,
+    items: dois.map((doi) => ({ doi, status: "pending", detail: "", pdf: "" })),
+  };
+  await writeBatch(state);
+
+  for (let index = 0; index < state.items.length; index += 1) {
+    const item = state.items[index];
+    state.current = index;
+    item.status = "working";
+    await writeBatch(state);
+
+    const target = base
+      ? DOIWebVPN.convert("https://doi.org/" + item.doi, base)
+      : "https://doi.org/" + item.doi;
+
+    let tab = null;
+    try {
+      tab = await chrome.tabs.create({ url: target, active: false });
+    } catch (err) {
+      item.status = "failed";
+      item.detail = "打不开标签页：" + (err && err.message);
+      await writeBatch(state);
+      continue;
+    }
+
+    let pdf = "";
+    let challenged = false;
+    const deadline = Date.now() + BATCH_TIMEOUT_MS;
+
+    while (Date.now() < deadline) {
+      await sleep(1500);
+      let info = null;
+      try {
+        const [result] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: sniffPage,
+        });
+        info = result && result.result;
+      } catch (err) {
+        info = null; // 页面正在跳转，下一轮再看
+      }
+      if (!info) continue;
+
+      const needsHuman =
+        DOIWebVPN.isChallengeTitle(info.title) || DOIWebVPN.isLoginUrl(info.url);
+      if (needsHuman) {
+        if (!challenged) {
+          challenged = true;
+          const login = DOIWebVPN.isLoginUrl(info.url);
+          item.status = "challenge";
+          item.detail = login
+            ? "网关需要登录：在这个标签页登录一次，登录后会自动继续"
+            : "需要在这个标签页点一下人工验证，验证后会自动继续";
+          await writeBatch(state);
+          try {
+            await chrome.tabs.update(tab.id, { active: true });
+          } catch (err) {
+            /* ignore */
+          }
+          notifyBatch("第 " + (index + 1) + " 篇需要人工操作，已切到该标签页");
+        }
+        continue;
+      }
+      if (challenged) {
+        challenged = false;
+        item.status = "working";
+        item.detail = "";
+        await writeBatch(state);
+      }
+
+      pdf = pickPdfUrl(info, base);
+      if (pdf) break;
+    }
+
+    if (pdf) {
+      try {
+        await chrome.downloads.download({
+          url: pdf,
+          filename: state.root + "/" + doiSlug(item.doi) + "/main.pdf",
+          conflictAction: "uniquify",
+        });
+        item.status = "downloaded";
+        item.pdf = pdf;
+        item.detail = "已开始下载";
+      } catch (err) {
+        item.status = "failed";
+        item.detail = "下载失败：" + (err && err.message);
+      }
+    } else if (challenged) {
+      item.status = "manual";
+      item.detail = "验证未完成，标签页保留着，可以手动下载";
+    } else {
+      item.status = "failed";
+      item.detail = "没找到 PDF 链接（可能需要机构权限）";
+    }
+    await writeBatch(state);
+
+    if (item.status !== "manual") {
+      try {
+        await chrome.tabs.remove(tab.id);
+      } catch (err) {
+        /* ignore */
+      }
+    }
+  }
+
+  state.running = false;
+  state.finishedAt = Date.now();
+  await writeBatch(state);
+
+  const done = state.items.filter((item) => item.status === "downloaded").length;
+  notifyBatch("批量完成：" + done + "/" + state.items.length + " 篇已下载");
+  return state;
+}
+
 /* -------------------------------------------------------------- 消息 */
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return false;
+
+  if (message.type === "batch-run") {
+    runBatch(message.dois || [], message.base || "").then(
+      (state) => sendResponse({ ok: true, state }),
+      (err) => sendResponse({ ok: false, error: String(err && err.message) })
+    );
+    return true;
+  }
+  if (message.type === "batch-state") {
+    readBatch().then((state) => sendResponse(state));
+    return true;
+  }
   if (message.type === "zotero-collections") {
     zoteroCollections().then(
       (info) => sendResponse(info),

@@ -120,6 +120,37 @@
         border: 1px solid var(--line); border-radius: 9px;
       }
       .ztarget[hidden] { display: none; }
+
+      .batch { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; }
+      .batch summary {
+        cursor: pointer; font-size: 12.5px; color: var(--muted);
+        list-style: none; user-select: none;
+      }
+      .batch summary::-webkit-details-marker { display: none; }
+      .batch summary::before { content: "▸ "; }
+      .batch[open] summary::before { content: "▾ "; }
+      .bcount { margin-left: 6px; color: var(--muted); }
+      .batch textarea, .batch input[type="text"] {
+        width: 100%; margin-top: 8px; padding: 8px 10px;
+        font: 12px "Consolas", "Cascadia Mono", monospace;
+        border: 1px solid var(--line); border-radius: 9px;
+        background: #fff; color: var(--ink); resize: vertical;
+      }
+      .bhint { margin-top: 6px; font-size: 11.5px; color: var(--muted); }
+      .bhint.warn { color: var(--fail); }
+      .blist { list-style: none; margin: 8px 0 0; padding: 0; max-height: 190px; overflow-y: auto; }
+      .blist li {
+        display: flex; gap: 8px; align-items: baseline;
+        font-size: 11.5px; padding: 4px 0; border-bottom: 1px dashed #eee;
+      }
+      .blist .bdoi {
+        font-family: "Consolas", monospace; flex: 1;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      }
+      .blist .bst { flex: 0 0 auto; color: var(--muted); }
+      .blist .bst.ok { color: var(--ok); }
+      .blist .bst.bad { color: var(--fail); }
+      .blist .bst.warn { color: #b8860b; }
     </style>
   </head>
   <body>
@@ -153,6 +184,17 @@
       </label>
 
       <select class="ztarget" id="ztarget" hidden></select>
+
+      <details class="batch" id="batchBox">
+        <summary>批量取件<span class="bcount" id="batchCount"></span></summary>
+        <textarea id="batchText" rows="4" spellcheck="false"
+          placeholder="每行一个 DOI 或论文链接，可一次粘贴很多条"></textarea>
+        <input id="wvpnBase" type="text" spellcheck="false"
+          placeholder="网关地址（可选）：https://wvpn.ustc.edu.cn" />
+        <button id="batchStart" class="btn ghost">开始批量</button>
+        <div class="bhint" id="batchHint"></div>
+        <ul class="blist" id="batchList"></ul>
+      </details>
 
       <div class="list" id="list"></div>
       <div class="tip" id="tip"></div>
