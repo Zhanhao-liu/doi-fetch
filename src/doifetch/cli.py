@@ -253,6 +253,8 @@ def batch(
     zot_target: str = typer.Option("", "--zotero-target", help="目标分类 ID，如 C9；留空跟随当前选中。"),
     report: Optional[Path] = typer.Option(None, "--report", help="结果表输出路径（默认与清单一同目录）。"),
     resume: bool = typer.Option(False, "--resume", help="读取已有结果表，跳过上次已下载的。"),
+    skip_prefix: str = typer.Option("", "--skip-prefix", help="跳过某些 DOI 前缀，逗号分隔，如 10.1016（需网关才能取的出版商）。"),
+    auth: Optional[str] = typer.Option(None, "--auth", help="授权方式：auto / webvpn / cookies / none。"),
 ) -> None:
     """批量处理 xlsx 清单里的 DOI。"""
     from . import batch as batch_mod
@@ -280,6 +282,8 @@ def batch(
         use_zotero=zot,
         zotero_target=zot_target,
         resume=previous,
+        skip_prefixes=skip_prefix.split(",") if skip_prefix else [],
+        auth_mode=auth,
         log=lambda message: typer.echo(message),
     )
 
@@ -288,9 +292,10 @@ def batch(
 
     typer.echo("")
     typer.secho(
-        f"完成：下载 {summary.downloaded}，跳过 {summary.skipped}，失败 {summary.failed}"
+        f"完成：下载 {summary.downloaded}，部分 {summary.partial}，"
+        f"跳过 {summary.skipped}，失败 {summary.failed}"
         + (f"，Zotero 新增 {summary.zotero_added}" if zot else ""),
-        fg=typer.colors.GREEN if not summary.failed else typer.colors.YELLOW,
+        fg=typer.colors.GREEN if not (summary.failed or summary.partial) else typer.colors.YELLOW,
     )
     if summary.aborted:
         typer.secho(f"注意：{summary.aborted}", fg=typer.colors.RED)
