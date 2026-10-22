@@ -10,7 +10,7 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from pathlib import Path
 from typing import Callable
 
-from . import auth, metadata as meta_mod, net, oa, publishers
+from . import auth, elsevier, metadata as meta_mod, net, oa, publishers
 from .config import (
     contact_email,
     default_out_dir,
@@ -148,6 +148,24 @@ def fetch(
                 page_pdfs, session, timeout=timeout, deadline=PUBLIC_DEADLINE
             )
             errors.extend(more)
+
+    # --- 4b. Elsevier API ---------------------------------------------------
+    # 唯一干净的程序化路径：sciencedirect.com 本身挂在 Cloudflare 后面，
+    # 自动化浏览器过不去挑战页，而 Elsevier 的官方接口不受这层影响。
+    if winner is None and elsevier.is_elsevier(doi):
+        api_binary, api_note = elsevier.fetch_pdf(
+            doi,
+            session=session,
+            webvpn=webvpn,
+            wvpn_session=wvpn_session,
+            timeout=timeout,
+        )
+        report.notes.append(f"elsevier api: {api_note}")
+        if api_binary is not None and api_binary.is_pdf:
+            winner = Candidate(
+                url=api_binary.final_url or elsevier.article_url(doi), source="elsevier:api"
+            )
+            binary = api_binary
 
     # --- 5. authenticated channel -----------------------------------------
     if winner is None and webvpn and wvpn_session:

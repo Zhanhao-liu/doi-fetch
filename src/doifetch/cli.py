@@ -239,6 +239,10 @@ def config_cmd(
     if not cfg:
         typer.echo("(empty)")
     for k, v in sorted(cfg.items()):
+        # 别把 key / token 明文打到终端或截图里
+        if any(word in k.lower() for word in ("key", "token", "secret", "password")):
+            text = str(v)
+            v = f"{text[:4]}…（已隐藏，{len(text)} 字符）" if text else "(未设置)"
         typer.echo(f"  {k} = {v}")
 
 

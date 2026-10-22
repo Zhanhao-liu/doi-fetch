@@ -342,6 +342,20 @@ SI 的发现顺序独立于正文（正文有 OA 版本不代表 SI 也开放）
 
   同一批 34 篇里的实际分布：Nature / Science 全部拿下（含付费墙的，走网关），Elsevier 6 篇全灭。
 
+- **Elsevier API 通道已内置，但需要机构授权（entitlement）**。命令行会自动尝试 `api.elsevier.com`（先直连、再走网关），这是唯一不受 Cloudflare 影响的程序化路径。配置：
+
+  ```powershell
+  doi-fetch config elsevier_api_key <your-key>      # dev.elsevier.com 免费申请
+  doi-fetch config elsevier_insttoken <token>       # 机构令牌，向图书馆索取
+  ```
+
+  只有 key 不够。实测：key 有效（能拿到结构化 `service-error`），但全文接口一律返回
+  `AUTHENTICATION_ERROR: Requestor configuration settings insufficient`——**连 Elsevier 自己标注为开放获取的文章也一样**，所以这不是"某篇没订阅"，而是授权没配上。Elsevier 要求请求来自订阅机构网段，或同时提供 `insttoken`。
+
+  注意 WebVPN 的出口 **不算**订阅网段（实测网关内、网关外返回同一个错误）。要让 key 生效，需要真正分配校内 IP 的 SSL VPN，或者向图书馆申请 `insttoken`。
+
+  > 附带一个反直觉的坑：Elsevier 文档建议请求带"描述性 User-Agent"，但 `api.elsevier.com` 前面套了 Cloudflare——只有写着 `doi-fetch (...)` 的 UA 会被判成机器人并返回一大坨 HTML 403，换成浏览器 UA 才能拿到正常的 XML 报错。代码按实际行为走。
+
 ## 开发
 
 ```powershell
