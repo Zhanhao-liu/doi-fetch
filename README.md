@@ -1,5 +1,18 @@
 # doi-fetch
 
+**Give it a DOI, get the article PDF *and* its supplementary information.**
+
+A browser extension (Chrome / Edge, no companion software) plus a Python CLI and desktop window.
+It reuses the access you already have in your browser — including campus WebVPN / CARSI — and can file
+the paper and its attachments straight into Zotero. Anything a publisher shows a PDF link for, it can
+fetch; it never bypasses a paywall. MIT licensed, Windows-first.
+
+> **Install the extension:** grab the zip from [Releases](../../releases/latest), unzip it, then
+> `chrome://extensions` → enable Developer mode → *Load unpacked* → pick the unzipped folder.
+> Documentation below is in Chinese.
+
+---
+
 给一个 DOI，拿到**全文 PDF** 和**补充材料（SI）**。支持校园网关（WebVPN）授权下载。
 
 ## 浏览器扩展：在论文页点一下
@@ -8,10 +21,11 @@
 
 **安装（一次性，约 30 秒）**
 
-1. 打开 `chrome://extensions`
-2. 右上角打开「开发者模式」
-3. 点「加载已解压的扩展程序」，选择本项目下的 `extension` 文件夹
-4. 把「DOI 取件器」固定到工具栏（拼图图标 → 图钉）
+1. 从 [Releases](../../releases/latest) 下载扩展 zip 解压，或直接用本仓库的 `extension` 文件夹
+2. 打开 `chrome://extensions`
+3. 右上角打开「开发者模式」
+4. 点「加载已解压的扩展程序」，选择解压出来的文件夹（或本项目的 `extension` 目录）
+5. 把「DOI 取件器」固定到工具栏（拼图图标 → 图钉）
 
 **使用**
 

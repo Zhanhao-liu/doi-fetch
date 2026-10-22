@@ -29,3 +29,6 @@ gui_shot.png
 # Saved gateway cookies / personal config never belong in git
 state.json
 config.json
+
+# Local build output
+_build/
