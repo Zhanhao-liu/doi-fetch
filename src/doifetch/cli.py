@@ -243,6 +243,63 @@ def config_cmd(
 
 
 @app.command()
+def batch(
+    manifest: Path = typer.Argument(..., exists=True, help="包含 DOI 的 .xlsx 清单。"),
+    out: Optional[Path] = typer.Option(None, "--out", "-o", help="输出根目录。"),
+    si: bool = typer.Option(True, "--si/--no-si", help="是否同时下载补充材料。"),
+    limit: int = typer.Option(0, "--limit", "-n", help="只处理前 N 篇（0 = 全部）。"),
+    delay: float = typer.Option(3.0, "--delay", help="每篇之间的间隔秒数。"),
+    zot: bool = typer.Option(False, "--zotero/--no-zotero", help="同时写入 Zotero（库中已有则跳过）。"),
+    zot_target: str = typer.Option("", "--zotero-target", help="目标分类 ID，如 C9；留空跟随当前选中。"),
+    report: Optional[Path] = typer.Option(None, "--report", help="结果表输出路径（默认与清单一同目录）。"),
+    resume: bool = typer.Option(False, "--resume", help="读取已有结果表，跳过上次已下载的。"),
+) -> None:
+    """批量处理 xlsx 清单里的 DOI。"""
+    from . import batch as batch_mod
+
+    report_path = report or manifest.with_name(manifest.stem + "-结果.xlsx")
+
+    typer.echo(f"读取清单：{manifest}")
+    rows = batch_mod.read_manifest(manifest)
+    usable = [row for row in rows if row.doi]
+    missing = len(rows) - len(usable)
+    typer.echo(f"  识别到 {len(usable)} 个 DOI" + (f"，{missing} 行无 DOI" if missing else ""))
+
+    if not usable:
+        typer.secho("清单里没有找到 DOI", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+
+    previous = batch_mod.read_previous_report(report_path) if resume else {}
+
+    summary = batch_mod.run_batch(
+        rows,
+        out=out,
+        want_si=si,
+        delay=delay,
+        limit=limit,
+        use_zotero=zot,
+        zotero_target=zot_target,
+        resume=previous,
+        log=lambda message: typer.echo(message),
+    )
+
+    batch_mod.write_report(report_path, rows)
+    summary.report_path = str(report_path)
+
+    typer.echo("")
+    typer.secho(
+        f"完成：下载 {summary.downloaded}，跳过 {summary.skipped}，失败 {summary.failed}"
+        + (f"，Zotero 新增 {summary.zotero_added}" if zot else ""),
+        fg=typer.colors.GREEN if not summary.failed else typer.colors.YELLOW,
+    )
+    if summary.aborted:
+        typer.secho(f"注意：{summary.aborted}", fg=typer.colors.RED)
+    typer.echo(f"结果表：{summary.report_path}")
+
+    raise typer.Exit(code=0 if summary.failed == 0 else 1)
+
+
+@app.command()
 def serve(
     port: int = typer.Option(8765, "--port", help="Local port for the browser extension."),
 ) -> None:

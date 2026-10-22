@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from doifetch import net, publishers, schools
@@ -236,3 +238,61 @@ def test_metadata_slug_is_filesystem_safe():
     meta = Metadata(title='What: a <weird> / title? with "chars"', authors=["Doe, Jane"], year="2020")
     name = meta.dirname
     assert not any(ch in name for ch in '<>:"/\\|?*')
+
+
+# --- batch manifest ---------------------------------------------------------
+
+
+def test_read_manifest_extracts_and_dedupes(tmp_path):
+    from openpyxl import Workbook
+
+    from doifetch.batch import read_manifest
+
+    path = tmp_path / "list.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["题目", "DOI"])
+    sheet.append(["Paper A", "10.1038/s41467-023-44674-1"])
+    sheet.append(["重复项", "https://doi.org/10.1038/s41467-023-44674-1"])
+    sheet.append(["Paper B", "10.1371/journal.pone.0229668."])
+    sheet.append(["没有 DOI 的一行", "只是备注"])
+    workbook.save(path)
+
+    rows = read_manifest(path)
+    dois = [row.doi for row in rows if row.doi]
+    assert dois == ["10.1038/s41467-023-44674-1", "10.1371/journal.pone.0229668"]
+    # 表头被跳过，无 DOI 的数据行保留下来提示用户
+    assert rows[0].source_row == 2
+    assert any(row.status == "no-doi" for row in rows)
+
+
+def test_clean_doi_strips_trailing_punctuation():
+    from doifetch.batch import _clean_doi
+
+    assert _clean_doi("10.1038/x).") == "10.1038/x"
+    assert _clean_doi("  10.1/y  ") == "10.1/y"
+
+
+# --- Zotero client ----------------------------------------------------------
+
+
+def test_zotero_header_json_stays_ascii():
+    """X-Metadata travels in an HTTP header: only ISO-8859-1 is legal there."""
+    from doifetch.zotero import _escape_header_json
+
+    header = _escape_header_json({"title": "正文 PDF", "parentItemID": "doifetch-main"})
+    assert all(ord(ch) < 0x80 for ch in header)
+    assert json.loads(header)["title"] == "正文 PDF"
+
+
+def test_zotero_creators_split():
+    from doifetch.zotero import _creators
+
+    assert _creators(["Yin, Peng"])[0] == {
+        "creatorType": "author",
+        "lastName": "Yin",
+        "firstName": "Peng",
+    }
+    assert _creators(["Vaswani"])[0]["lastName"] == "Vaswani"
+    assert _creators(["Ashish Vaswani"])[0]["firstName"] == "Ashish"
+    assert _creators([""]) == []

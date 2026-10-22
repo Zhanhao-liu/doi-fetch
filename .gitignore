@@ -32,3 +32,8 @@ config.json
 
 # Local build output
 _build/
+
+# Test scratch space
+_batch_test/
+pytest-of-*/
+

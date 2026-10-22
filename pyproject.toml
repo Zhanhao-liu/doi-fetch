@@ -13,6 +13,7 @@ dependencies = [
     "lxml>=5.0",
     "typer>=0.15",
     "pypdf>=4.2",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]
