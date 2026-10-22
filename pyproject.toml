@@ -1,0 +1,35 @@
+[project]
+name = "doi-fetch"
+version = "0.6.0"
+description = "DOI -> full-text PDF + supplementary materials, with institutional auth"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "zhao_l0230", email = "zhao_l0230@mail.ustc.edu.cn" }]
+keywords = ["doi", "pdf", "supplementary-information", "zotero", "webvpn", "literature"]
+dependencies = [
+    "requests[socks]>=2.31",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    "typer>=0.15",
+    "pypdf>=4.2",
+]
+
+[project.optional-dependencies]
+browser = ["playwright>=1.45"]
+webvpn = ["pycryptodome>=3.20"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+doi-fetch = "doifetch.cli:main"
+doi-fetch-gui = "doifetch.gui:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+doifetch = ["data/*.json"]

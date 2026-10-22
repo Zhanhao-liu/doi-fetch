@@ -1,0 +1,31 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+
+# Local output, downloaded papers and throwaway probes
+_test_out*/
+_test_*/
+_ext_test/
+_gui_selftest/
+_final_check/
+_flat_check/
+_data/
+papers/
+_probe_*.py
+_login.html
+_js_*
+_fix.py
+_z*.png
+gui_shot.png
+
+# Saved gateway cookies / personal config never belong in git
+state.json
+config.json
