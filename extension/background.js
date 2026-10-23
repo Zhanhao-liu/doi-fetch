@@ -569,14 +569,21 @@ function doiSlug(doi) {
 /* 注入到论文页里，只读取、不修改 */
 function sniffPage() {
   const meta = document.querySelector('meta[name="citation_pdf_url"]');
-  const anchors = Array.from(document.querySelectorAll("a[href]"))
+  const anchors = Array.from(document.querySelectorAll("a[href]"));
+  const pdfLinks = anchors
     .map((anchor) => anchor.href)
     .filter((href) => /\/pdfft|\.pdf(\?|$)|\/pdf(\?|$)/i.test(href));
+  // 注意：注入到页面的函数必须自包含，不能引用 service worker 里的变量
+  const siPattern = /supplement|supporting|moesm|_esm|_si_|appendix|additional-file|补充|附加/i;
+  const siLinks = anchors
+    .filter((anchor) => siPattern.test(anchor.href) || siPattern.test(anchor.textContent || ""))
+    .map((anchor) => anchor.href);
   return {
     title: document.title,
     ready: document.readyState,
     meta: meta ? meta.content : "",
-    links: anchors.slice(0, 5),
+    links: pdfLinks.slice(0, 5),
+    si: Array.from(new Set(siLinks)).slice(0, 20),
     url: location.href,
   };
 }
@@ -623,6 +630,135 @@ function notifyBatch(text) {
   }
 }
 
+function pickSiUrls(info, base, pdfUrl) {
+  const seen = new Set([pdfUrl]);
+  const out = [];
+  for (const raw of (info && info.si) || []) {
+    let url = String(raw).trim();
+    if (!url) continue;
+    if (base && /^https?:\/\//i.test(url) && !url.startsWith(base)) {
+      url = DOIWebVPN.convert(url, base);
+    }
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
+function siFilename(url, index) {
+  let name = "";
+  try {
+    const parsed = new URL(url);
+    name = decodeURIComponent((parsed.pathname.split("/").pop() || "").trim());
+  } catch (err) {
+    name = "";
+  }
+  name = name.replace(/[\\/:*?"<>|]+/g, "-").trim();
+  if (!name || name.length > 90) name = "SI-" + index;
+  if (!/\.[a-z0-9]{2,5}$/i.test(name)) name += ".pdf";
+  return name;
+}
+
+/**
+ * 只读响应开头的几个字节，判断到底拿回的是什么。
+ *
+ * 不能等下载完再看文件名：Chrome 按 Content-Type 决定扩展名，而验证页返回的
+ * HTML 会被存成 .html（用户看到的就是 main.html）。先探一次文件头，既准确又
+ * 不会把验证页落到磁盘上，也省得为几十 MB 的 PDF 先猜后错。
+ */
+async function probeDocument(url) {
+  let response = null;
+  try {
+    response = await fetch(url, { credentials: "include", redirect: "follow" });
+  } catch (err) {
+    return { kind: "error", reason: "连不上：" + (err && err.message) };
+  }
+  if (!response.ok) {
+    return { kind: "error", reason: "HTTP " + response.status };
+  }
+
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  let head = "";
+  try {
+    const reader = response.body.getReader();
+    const chunk = await reader.read();
+    reader.cancel().catch(() => {});
+    const bytes = (chunk && chunk.value) || new Uint8Array();
+    head = new TextDecoder("latin1").decode(bytes.slice(0, 64));
+  } catch (err) {
+    return { kind: "error", reason: "读取响应失败" };
+  }
+
+  const trimmed = head.replace(/^\s+/, "");
+  if (trimmed.startsWith("%PDF-")) return { kind: "pdf", contentType };
+  if (
+    trimmed.startsWith("<") ||
+    contentType.includes("text/html") ||
+    contentType.includes("application/xhtml")
+  ) {
+    return { kind: "html", reason: contentType || "HTML 页面" };
+  }
+  if (trimmed.startsWith("PK")) return { kind: "zip", contentType };
+  if (trimmed.startsWith("{")) return { kind: "json", contentType };
+  return { kind: "other", contentType };
+}
+
+/**
+ * 先探类型、再下载，落盘后仍然核对一次文件名。
+ *
+ * requirePdf=true 时只接受 %PDF-；补充材料允许 xlsx/zip/docx 等，但拒绝 HTML。
+ */
+async function downloadVerified(url, filename, requirePdf) {
+  const probe = await probeDocument(url);
+  if (requirePdf && probe.kind !== "pdf") {
+    return { ok: false, reason: "拿到的是 " + (probe.kind === "html" ? "网页" : probe.kind) + "，不是 PDF" };
+  }
+  if (!requirePdf && (probe.kind === "html" || probe.kind === "error")) {
+    return { ok: false, reason: probe.kind === "html" ? "是网页，不是附件" : probe.reason };
+  }
+
+  let id = null;
+  try {
+    id = await startDownload({ url, filename, conflictAction: "uniquify" });
+  } catch (err) {
+    return { ok: false, reason: String(err && err.message) };
+  }
+
+  const outcome = await waitForDownload(id, 180000);
+  let record = null;
+  try {
+    const found = await chrome.downloads.search({ id });
+    record = (found && found[0]) || null;
+  } catch (err) {
+    record = null;
+  }
+
+  const savedName = record ? String(record.filename || "").split(/[\\/]/).pop() : "";
+  const landedHtml = /\.html?$/i.test(savedName);
+
+  if (outcome === "complete" && !landedHtml) {
+    return { ok: true, name: savedName, size: (record && record.fileSize) || 0 };
+  }
+
+  // 兜底：内容类型判断没拦住、却仍然落成网页 → 删掉，别留垃圾
+  try {
+    await chrome.downloads.removeFile(id);
+  } catch (err) {
+    /* ignore */
+  }
+  try {
+    await chrome.downloads.erase({ id });
+  } catch (err) {
+    /* ignore */
+  }
+
+  if (outcome !== "complete") {
+    return { ok: false, reason: outcome === "timeout" ? "下载超时" : "下载中断" };
+  }
+  return { ok: false, reason: "落盘成了 " + savedName };
+}
+
 async function runBatch(dois, base) {
   const state = {
     id: "b" + Date.now().toString(36),
@@ -658,7 +794,9 @@ async function runBatch(dois, base) {
 
     let pdf = "";
     let challenged = false;
+    let lastInfo = null;
     const deadline = Date.now() + BATCH_TIMEOUT_MS;
+    let settleDeadline = 0;
 
     while (Date.now() < deadline) {
       await sleep(1500);
@@ -701,23 +839,43 @@ async function runBatch(dois, base) {
         await writeBatch(state);
       }
 
+      lastInfo = info;
       pdf = pickPdfUrl(info, base);
       if (pdf) break;
+
+      // 页面已经加载完却没有 PDF 链接：多半是付费墙，别干等到超时
+      if (info.ready === "complete" && !settleDeadline) {
+        settleDeadline = Date.now() + 25000;
+      }
+      if (settleDeadline && Date.now() > settleDeadline) break;
     }
 
+    const folder = state.root + "/" + doiSlug(item.doi);
+    item.si = item.si || [];
+
     if (pdf) {
-      try {
-        await chrome.downloads.download({
-          url: pdf,
-          filename: state.root + "/" + doiSlug(item.doi) + "/main.pdf",
-          conflictAction: "uniquify",
-        });
+      const main = await downloadVerified(pdf, folder + "/main.pdf", true);
+      if (main.ok) {
         item.status = "downloaded";
         item.pdf = pdf;
-        item.detail = "已开始下载";
-      } catch (err) {
+        item.saved = main.name;
+
+        const siUrls = pickSiUrls(lastInfo, base, pdf);
+        for (let n = 0; n < siUrls.length && n < 10; n += 1) {
+          const got = await downloadVerified(
+            siUrls[n],
+            folder + "/" + siFilename(siUrls[n], n + 1),
+            false
+          );
+          if (got.ok) item.si.push(got.name);
+        }
+        item.detail =
+          "正文已保存" +
+          (item.si.length ? "，补充材料 " + item.si.length + " 个" : "，未发现补充材料");
+        await writeBatch(state);
+      } else {
         item.status = "failed";
-        item.detail = "下载失败：" + (err && err.message);
+        item.detail = "拿到的不是 PDF（" + main.reason + "），已删除，没留垃圾文件";
       }
     } else if (challenged) {
       item.status = "manual";
