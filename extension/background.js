@@ -891,8 +891,24 @@ async function runBatch(dois, base) {
           (item.si.length ? "，补充材料 " + item.si.length + " 个" : "，未发现补充材料");
         await writeBatch(state);
       } else {
-        item.status = "failed";
-        item.detail = "拿到的不是 PDF（" + main.reason + "），已删除，没留垃圾文件";
+        // 正文拿不到，但很多补充材料挂在公开 CDN 上，值得单独试一次
+        const siUrls = pickSiUrls(lastInfo, base, "");
+        for (let n = 0; n < siUrls.length && n < 10; n += 1) {
+          const got = await downloadVerified(
+            siUrls[n],
+            folder + "/" + siFilename(siUrls[n], n + 1),
+            false
+          );
+          if (got.ok) item.si.push(got.name);
+        }
+        if (item.si.length) {
+          item.status = "partial";
+          item.detail =
+            "正文拿不到（" + main.reason + "），已取回补充材料 " + item.si.length + " 个";
+        } else {
+          item.status = "failed";
+          item.detail = "正文拿不到（" + main.reason + "），也没有可下载的补充材料";
+        }
       }
     } else if (challenged) {
       item.status = "manual";
@@ -923,6 +939,30 @@ async function runBatch(dois, base) {
 
 /* -------------------------------------------------------------- 消息 */
 
+/* 注入页面执行：用页面自己的 Referer 与会话探测资源类型 */
+function probeInPage(url) {
+  return fetch(url, { credentials: "include" })
+    .then(async (response) => {
+      const reader = response.body.getReader();
+      const chunk = await reader.read();
+      reader.cancel().catch(() => {});
+      const bytes = (chunk && chunk.value) || new Uint8Array();
+      const head = String.fromCharCode.apply(null, Array.from(bytes.slice(0, 5)));
+      const preview = new TextDecoder()
+        .decode(bytes.slice(0, 240))
+        .replace(/\s+/g, " ")
+        .trim();
+      return {
+        status: response.status,
+        type: (response.headers.get("content-type") || "").toLowerCase(),
+        head: head,
+        preview: preview,
+        size: bytes.length,
+      };
+    })
+    .catch((err) => ({ error: String(err && err.message) }));
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return false;
 
@@ -952,7 +992,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           reason: probe.reason || "",
         });
       }
-      sendResponse({ ok: true, rows });
+        // 同一个 URL，再从页面上下文取一次：这里带 Referer 和页面自己的会话，
+        // 能区分「没权限」和「被 Cloudflare 拦自动化」。
+        const tabId = message.tabId;
+        if (tabId && urls.length) {
+          let first = String(urls[0]).trim();
+          if (base && /^https?:\/\//i.test(first) && !first.startsWith(base)) {
+            first = DOIWebVPN.convert(first, base);
+          }
+          try {
+            const [injected] = await chrome.scripting.executeScript({
+              target: { tabId },
+              func: probeInPage,
+              args: [first],
+            });
+            const page = injected && injected.result;
+            if (page) {
+              rows.push({
+                url: "[页面上下文] " + first.slice(0, 140),
+                kind: page.head === "%PDF-" ? "pdf" : page.type.includes("html") ? "html" : "other",
+                contentType: page.type || "",
+                reason:
+                  "status=" + page.status +
+                  " size=" + page.size +
+                  (page.head === "%PDF-" ? "" : " 开头: " + (page.preview || page.error || "")),
+              });
+            }
+          } catch (err) {
+            rows.push({ url: "[页面上下文] " + first.slice(0, 120), kind: "error", contentType: "", reason: String(err && err.message) });
+          }
+        }
+
+        sendResponse({ ok: true, rows });
     })();
     return true;
   }

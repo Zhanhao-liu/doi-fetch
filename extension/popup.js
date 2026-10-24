@@ -85,9 +85,15 @@ async function diagnoseCurrentPage() {
     ];
 
     if (urls.length) {
-      const reply = await chrome.runtime.sendMessage({ type: "diagnose", urls, base });
+      const reply = await chrome.runtime.sendMessage({
+        type: "diagnose",
+        urls,
+        base,
+        tabId: tab.id,
+      });
       for (const row of (reply && reply.rows) || []) {
-        lines.push("[" + row.kind + "] " + (row.contentType || row.reason || ""));
+        lines.push("[" + row.kind + "] " + (row.contentType || ""));
+        if (row.reason) lines.push("  " + row.reason);
         lines.push("  " + row.url);
       }
     } else {
