@@ -35,7 +35,72 @@ const el = {
   batchHint: document.getElementById("batchHint"),
   batchList: document.getElementById("batchList"),
   wvpnBase: document.getElementById("wvpnBase"),
+  diagBtn: document.getElementById("diagBtn"),
+  diagOut: document.getElementById("diagOut"),
 };
+
+/* 注入页面：只读取，不修改（必须自包含，不能引用本文件的其它变量） */
+function sniffForDiag() {
+  const meta = document.querySelector('meta[name="citation_pdf_url"]');
+  const anchors = Array.from(document.querySelectorAll("a[href]"));
+  const pdf = anchors
+    .map((anchor) => anchor.href)
+    .filter((href) => /\/pdfft|\.pdf(\?|$)|\/pdf(\?|$)/i.test(href));
+  const siPattern = /supplement|supporting|moesm|_esm|_si_|appendix|additional-file|补充|附加/i;
+  const si = anchors
+    .filter((anchor) => siPattern.test(anchor.href) || siPattern.test(anchor.textContent || ""))
+    .map((anchor) => anchor.href);
+  return {
+    url: location.href,
+    title: document.title,
+    meta: meta ? meta.content : "",
+    pdf: Array.from(new Set(pdf)).slice(0, 5),
+    si: Array.from(new Set(si)).slice(0, 6),
+  };
+}
+
+async function diagnoseCurrentPage() {
+  el.diagBtn.disabled = true;
+  el.diagOut.hidden = false;
+  el.diagOut.value = "检测中…";
+
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) throw new Error("没有活动标签页");
+
+    const [injected] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: sniffForDiag,
+    });
+    const info = (injected && injected.result) || {};
+    const base = (el.wvpnBase.value || "").trim().replace(/\/+$/, "");
+    const urls = [info.meta, ...(info.pdf || [])].filter(Boolean);
+
+    const lines = [
+      "标题: " + String(info.title || "").slice(0, 60),
+      "地址: " + String(info.url || "").slice(0, 100),
+      "citation_pdf_url: " + String(info.meta || "（无）").slice(0, 90),
+      "PDF 链接: " + (info.pdf || []).length + " 个 | 补充材料: " + (info.si || []).length + " 个",
+      "",
+    ];
+
+    if (urls.length) {
+      const reply = await chrome.runtime.sendMessage({ type: "diagnose", urls, base });
+      for (const row of (reply && reply.rows) || []) {
+        lines.push("[" + row.kind + "] " + (row.contentType || row.reason || ""));
+        lines.push("  " + row.url);
+      }
+    } else {
+      lines.push("页面里没找到 PDF 链接 —— 可能是验证页，或论文页还没加载完。");
+    }
+
+    el.diagOut.value = lines.join("\n");
+  } catch (err) {
+    el.diagOut.value = "诊断失败: " + (err && err.message);
+  } finally {
+    el.diagBtn.disabled = false;
+  }
+}
 
 /* ------------------------------------------------------------ 批量取件 */
 
@@ -776,6 +841,7 @@ chrome.runtime.onMessage.addListener((message) => {
 
   // 批量取件
   el.batchStart.addEventListener("click", startBatch);
+  el.diagBtn.addEventListener("click", diagnoseCurrentPage);
   el.batchText.addEventListener("input", () => {
     const count = parseDois(el.batchText.value).length;
     el.batchHint.className = "bhint";

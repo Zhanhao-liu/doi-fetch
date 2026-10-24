@@ -711,11 +711,15 @@ async function probeDocument(url) {
  */
 async function downloadVerified(url, filename, requirePdf) {
   const probe = await probeDocument(url);
-  if (requirePdf && probe.kind !== "pdf") {
-    return { ok: false, reason: "拿到的是 " + (probe.kind === "html" ? "网页" : probe.kind) + "，不是 PDF" };
+
+  // 明确是 HTML 就不必下载了
+  if (probe.kind === "html") {
+    return { ok: false, reason: "拿到的是网页，不是 PDF（多半是验证页或没有权限）" };
   }
-  if (!requirePdf && (probe.kind === "html" || probe.kind === "error")) {
-    return { ok: false, reason: probe.kind === "html" ? "是网页，不是附件" : probe.reason };
+  // 探测本身失败（跨域、被网关拒、超时）不代表文件有问题——
+  // downloads 的请求特征和 fetch 不同，可能只有后者被拦。交给落盘结果裁决。
+  if (probe.kind !== "pdf" && probe.kind !== "error" && requirePdf) {
+    return { ok: false, reason: "拿到的是 " + probe.kind + "，不是 PDF" };
   }
 
   let id = null;
@@ -756,7 +760,10 @@ async function downloadVerified(url, filename, requirePdf) {
   if (outcome !== "complete") {
     return { ok: false, reason: outcome === "timeout" ? "下载超时" : "下载中断" };
   }
-  return { ok: false, reason: "落盘成了 " + savedName };
+  if (landedHtml) {
+    return { ok: false, reason: "落盘成了网页（" + savedName + "），已删除" };
+  }
+  return { ok: false, reason: "下载完成但内容无法确认（" + (savedName || "未知文件名") + "）" };
 }
 
 async function runBatch(dois, base) {
@@ -768,7 +775,7 @@ async function runBatch(dois, base) {
     startedAt: Date.now(),
     finishedAt: 0,
     current: 0,
-    items: dois.map((doi) => ({ doi, status: "pending", detail: "", pdf: "" })),
+    items: dois.map((doi) => ({ doi, status: "pending", detail: "", pdf: "", landing: "" })),
   };
   await writeBatch(state);
 
@@ -778,9 +785,19 @@ async function runBatch(dois, base) {
     item.status = "working";
     await writeBatch(state);
 
-    const target = base
-      ? DOIWebVPN.convert("https://doi.org/" + item.doi, base)
-      : "https://doi.org/" + item.doi;
+    // 关键：doi.org 会 302 到出版商的真实地址。若先把 doi.org 包进网关，
+    // 这次重定向会把页面带回未改写的地址，等于中途退出网关（付费墙 + 挑战页）。
+    // 所以先解析出落地地址，再决定包不包。
+    let landing = "https://doi.org/" + item.doi;
+    try {
+      const resolved = await fetch(landing, { redirect: "follow" });
+      if (resolved && resolved.url) landing = resolved.url;
+    } catch (err) {
+      /* 解析失败就用 doi.org 兜底 */
+    }
+    item.landing = landing;
+
+    const target = base ? DOIWebVPN.convert(landing, base) : landing;
 
     let tab = null;
     try {
@@ -916,6 +933,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
     return true;
   }
+  if (message.type === "diagnose") {
+    const urls = (message.urls || []).slice(0, 12);
+    const base = message.base || "";
+    (async () => {
+      const rows = [];
+      for (const raw of urls) {
+        let url = String(raw).trim();
+        if (!url) continue;
+        if (base && /^https?:\/\//i.test(url) && !url.startsWith(base)) {
+          url = DOIWebVPN.convert(url, base);
+        }
+        const probe = await probeDocument(url);
+        rows.push({
+          url: url.slice(0, 160),
+          kind: probe.kind,
+          contentType: probe.contentType || "",
+          reason: probe.reason || "",
+        });
+      }
+      sendResponse({ ok: true, rows });
+    })();
+    return true;
+  }
+
   if (message.type === "batch-state") {
     readBatch().then((state) => sendResponse(state));
     return true;
