@@ -766,6 +766,122 @@ async function downloadVerified(url, filename, requirePdf) {
   return { ok: false, reason: "下载完成但内容无法确认（" + (savedName || "未知文件名") + "）" };
 }
 
+/* ------------------------------------------------- 浏览器原生导航下载 */
+
+/**
+ * Elsevier 的 /pdfft 端点返回一张反爬中间页（noindex + nojspx），只有让标签页
+ * 真正导航过去、跑完它的 JS，浏览器才会发起文件下载。fetch() 和
+ * downloads.download() 都拿不到 PDF —— 这正是之前存成 main.html 的原因。
+ *
+ * 这里导航后监听 downloads，并用 onDeterminingFilename 把文件落到我们的目录。
+ */
+let nameHint = null;
+
+chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+  const hint = nameHint;
+  if (!hint) return false;
+  const looksPdf =
+    /application\/pdf/i.test(item.mime || "") ||
+    /\/pdfft|els-cdn|sciencedirect|\.pdf(\?|$)/i.test(item.url || "");
+  if (!looksPdf) return false;
+  nameHint = null;
+  suggest({ filename: hint.folder + "/" + hint.name, conflictAction: "uniquify" });
+  return true;
+});
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pageStatus(tabId) {
+  try {
+    const [done] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        title: document.title,
+        text: (document.body ? document.body.innerText : "").slice(0, 300),
+        html: document.documentElement ? document.documentElement.innerHTML.slice(0, 600) : "",
+      }),
+    });
+    return (done && done.result) || null;
+  } catch (err) {
+    return null;
+  }
+}
+
+function looksLikeGate(status) {
+  if (!status) return false;
+  const blob = ((status.title || "") + " " + (status.text || "") + " " + (status.html || "")).toLowerCase();
+  return (
+    blob.includes("nojspx") ||
+    blob.includes("noindex") ||
+    blob.includes("just a moment") ||
+    blob.includes("请稍候") ||
+    blob.includes("verify you are human") ||
+    blob.includes("are you a robot")
+  );
+}
+
+/** 导航到 PDF 地址，等浏览器自己下载。返回是否成功落盘。 */
+async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate) {
+  const startedAt = Date.now();
+  nameHint = { folder, name };
+
+  try {
+    await chrome.tabs.update(tabId, { url });
+  } catch (err) {
+    nameHint = null;
+    return { ok: false, reason: "打不开 PDF 地址" };
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  let gateReported = false;
+
+  while (Date.now() < deadline) {
+    await sleepMs(1500);
+
+    // 浏览器是否已经开始下载
+    let recent = [];
+    try {
+      recent = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 3 });
+    } catch (err) {
+      recent = [];
+    }
+    const fresh = recent.find(
+      (item) => item.startTime && Date.parse(item.startTime) >= startedAt - 2000
+    );
+    if (fresh) {
+      const outcome = await waitForDownload(fresh.id, 180000);
+      nameHint = null;
+      const saved = String(fresh.filename || "").split(/[\\/]/).pop();
+      if (outcome === "complete" && !/\.html?$/i.test(saved)) {
+        return { ok: true, name: saved, size: fresh.fileSize || 0 };
+      }
+      if (outcome !== "complete") {
+        return { ok: false, reason: outcome === "timeout" ? "下载超时" : "下载中断" };
+      }
+      return { ok: false, reason: "落盘成了网页（" + saved + "）" };
+    }
+
+    // 卡在中间页 / 验证页 → 把标签页切到前台让人点一下
+    if (!gateReported) {
+      const status = await pageStatus(tabId);
+      if (looksLikeGate(status)) {
+        gateReported = true;
+        try {
+          await chrome.tabs.update(tabId, { active: true });
+        } catch (err) {
+          /* ignore */
+        }
+        if (typeof onGate === "function") onGate();
+      }
+    }
+  }
+
+  nameHint = null;
+  return { ok: false, reason: "等待超时（页面可能需要点一下验证）", gate: gateReported };
+}
+
 async function runBatch(dois, base) {
   const state = {
     id: "b" + Date.now().toString(36),
@@ -871,7 +987,24 @@ async function runBatch(dois, base) {
     item.si = item.si || [];
 
     if (pdf) {
-      const main = await downloadVerified(pdf, folder + "/main.pdf", true);
+      // Elsevier 的 /pdfft 后面是反爬中间页，只有真实导航才放行；
+      // 其它出版商用校验下载即可（内联 PDF 在浏览器里打开，不会触发下载事件）
+      const gatedHost = /sciencedirect\.com|elsevier\.com/i.test(pdf);
+      const main = gatedHost
+        ? await downloadViaNavigation(
+        tab.id,
+        pdf,
+        folder,
+        "main.pdf",
+        90000,
+        async () => {
+          item.status = "challenge";
+          item.detail = "页面有反爬中间页，已切到该标签页：点一下确认后会自动继续";
+          await writeBatch(state);
+          notifyBatch("第 " + (index + 1) + " 篇需要在标签页里点一下");
+        }
+      )
+        : await downloadVerified(pdf, folder + "/main.pdf", true);
       if (main.ok) {
         item.status = "downloaded";
         item.pdf = pdf;
