@@ -512,6 +512,20 @@ function waitForDownload(id, timeoutMs) {
   });
 }
 
+async function clickInActiveTab() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !tab.id) return "";
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, allFrames: true },
+      func: clickPdfLink,
+    });
+    return (result && result.result) || "";
+  } catch (err) {
+    return "";
+  }
+}
+
 async function runDownloads(job) {
   const { tasks, root } = job;
   const total = tasks.length;
@@ -520,6 +534,41 @@ async function runDownloads(job) {
   for (let index = 0; index < tasks.length; index += 1) {
     const task = tasks[index];
     await emit({ index, total, name: task.label, state: "start" });
+
+    // 正文优先"点页面里自己的链接"：导航请求才带 Referer 和完整头，
+    // 出版社会把 downloads API / fetch 当成自动化抓取并回一张 HTML。
+    const gated = /sciencedirect\.com|elsevier\.com/i.test(task.url || "");
+    const isBody = index === 0 || /正文|main/i.test(task.label || "");
+    if (gated && isBody) {
+      nameHint = { folder: root, name: task.name };
+      const clicked = await clickInActiveTab();
+      if (clicked) {
+        await emit({ index, total, name: task.label, state: "start", note: "已在页面里点击 PDF 链接" });
+        const got = await grabFreshDownload(Date.now(), 25000);
+        nameHint = null;
+        if (got && got.ok) {
+          done += 1;
+          await emit({ index, total, name: task.label, state: "ok" });
+          continue;
+        }
+      } else {
+        nameHint = null;
+      }
+    }
+
+    // 下载前先看内容类型：链接指向网页（补充材料的说明页、拦截页）就别下了
+    const before = await probeDocument(task.url);
+    if (before.kind === "html") {
+      await emit({
+        index,
+        total,
+        name: task.label,
+        state: "fail",
+        error: "链接指向的是网页而不是文件，已跳过",
+      });
+      continue;
+    }
+
     try {
       const id = await startDownload({
         url: task.url,
@@ -528,9 +577,39 @@ async function runDownloads(job) {
         conflictAction: "uniquify",
       });
       const state = await waitForDownload(id, 180000);
-      if (state === "complete") {
+
+      let record = null;
+      try {
+        const found = await chrome.downloads.search({ id });
+        record = (found && found[0]) || null;
+      } catch (err) {
+        record = null;
+      }
+      const saved = record ? String(record.filename || "").split(/[\\/]/).pop() : "";
+      const landedHtml = /\.html?$/i.test(saved);
+
+      if (state === "complete" && !landedHtml) {
         done += 1;
         await emit({ index, total, name: task.label, state: "ok" });
+      } else if (state === "complete" && landedHtml) {
+        // 存成网页说明拿到的是拦截页，删掉别留垃圾
+        try {
+          await chrome.downloads.removeFile(id);
+        } catch (err) {
+          /* ignore */
+        }
+        try {
+          await chrome.downloads.erase({ id });
+        } catch (err) {
+          /* ignore */
+        }
+        await emit({
+          index,
+          total,
+          name: task.label,
+          state: "fail",
+          error: "拿到的是网页不是 PDF，已删除",
+        });
       } else {
         await emit({
           index,
@@ -578,11 +657,29 @@ function sniffPage() {
   const siLinks = anchors
     .filter((anchor) => siPattern.test(anchor.href) || siPattern.test(anchor.textContent || ""))
     .map((anchor) => anchor.href);
+  // 排序后再取前几个：避免把参考文献里的 PDF 当成正文
+  const metaHref = meta ? meta.content : "";
+  const doiMeta = document.querySelector('meta[name="citation_doi"]');
+  const doiSuffix = doiMeta ? (doiMeta.content || "").split("/").pop() : "";
+  const pii = (location.pathname.match(/\/pii\/([A-Za-z0-9]+)/) || [])[1] || "";
+
+  const rank = (href) => {
+    let value = 0;
+    if (metaHref && href === metaHref) value += 300;
+    if (pii && href.indexOf(pii) >= 0) value += 100;
+    if (doiSuffix && href.indexOf(doiSuffix) >= 0) value += 80;
+    if (href.indexOf(location.hostname) >= 0) value += 50;
+    if (/\/pdfft/.test(href)) value += 20;
+    return value;
+  };
+
+  const sorted = Array.from(new Set(pdfLinks)).sort((a, b) => rank(b) - rank(a));
+
   return {
     title: document.title,
     ready: document.readyState,
-    meta: meta ? meta.content : "",
-    links: pdfLinks.slice(0, 5),
+    meta: metaHref,
+    links: sorted.slice(0, 5),
     si: Array.from(new Set(siLinks)).slice(0, 20),
     url: location.href,
   };
@@ -1013,6 +1110,56 @@ function pdfVariants(url, base) {
   return Array.from(new Set(out));
 }
 
+/**
+ * 点击页面里的 PDF 链接，让**浏览器自己**去请求它。
+ *
+ * 这是关键区别：downloads API / fetch 发出的请求不带 Referer、也不是导航请求，
+ * Elsevier 会把它们当成自动化抓取并回一张 403 的 tdm-reservation 页面（就是存成
+ * main.html 的那个）。而点击真实链接是导航请求，浏览器带上完整头和会话，服务器
+ * 正常返回 PDF —— 用户手点时能下载，正是这个原因。
+ *
+ * 注入函数必须自包含。
+ */
+function clickPdfLink() {
+  const pii = (location.pathname.match(/\/pii\/([A-Za-z0-9]+)/) || [])[1] || "";
+  const anchors = Array.from(document.querySelectorAll("a[href]"));
+  const pdfish = anchors.filter((a) => /\/pdfft|\/pdf(\?|$)|\.pdf(\?|$)/i.test(a.href));
+  if (!pdfish.length) return "";
+
+  const meta = document.querySelector('meta[name="citation_pdf_url"]');
+  const metaHref = meta ? meta.content : "";
+  const doiMeta = document.querySelector('meta[name="citation_doi"]');
+  const doiSuffix = doiMeta ? (doiMeta.content || "").split("/").pop() : "";
+
+  const score = (a) => {
+    let value = 0;
+    if (metaHref && a.href === metaHref) value += 300;        // 官方声明最可信
+    if (pii && a.href.indexOf(pii) >= 0) value += 100;        // 本文优先
+    if (doiSuffix && a.href.indexOf(doiSuffix) >= 0) value += 80;
+    if (a.hostname === location.hostname) value += 50;        // 同站优先
+    else value -= 60;                                          // 外链多为参考文献
+    if (/\/pdfft/.test(a.href)) value += 20;
+    if (new RegExp("main\\.pdf", "i").test(a.href)) value += 10;
+    if (/pdf/i.test(a.textContent || "")) value += 15;
+    const section = a.closest("section,li,div");
+    if (section && /reference|bibliograph/i.test(section.id || "")) value -= 150;
+    return value;
+  };
+
+  const best = pdfish.sort((x, y) => score(y) - score(x))[0];
+  if (!best) return "";
+
+  const href = best.href;
+  try {
+    best.setAttribute("target", "_self");
+    best.removeAttribute("download");
+    best.click();
+  } catch (err) {
+    return "";
+  }
+  return href;
+}
+
 async function runBatch(dois, base) {
   const state = {
     id: "b" + Date.now().toString(36),
@@ -1065,6 +1212,7 @@ async function runBatch(dois, base) {
     let lastInfo = null;
     let attempts = 0;
     let viewerSeen = false;
+    let clickAttempted = false;
     const tried = new Set();
     const deadline = Date.now() + BATCH_TIMEOUT_MS;
     let settleDeadline = 0;
@@ -1153,6 +1301,33 @@ async function runBatch(dois, base) {
         if (info.ready === "complete" && !settleDeadline) settleDeadline = Date.now() + 20000;
         if (settleDeadline && Date.now() > settleDeadline) break;
         continue;
+      }
+
+      // 先让浏览器自己去点那个 PDF 链接：它发的才是导航请求
+      if (!clickAttempted) {
+        clickAttempted = true;
+        let clicked = "";
+        try {
+          const [res] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id, allFrames: true },
+            func: clickPdfLink,
+          });
+          clicked = (res && res.result) || "";
+        } catch (err) {
+          clicked = "";
+        }
+        if (clicked) {
+          item.detail = "已点击页面里的 PDF 链接，等浏览器发起下载…";
+          await writeBatch(state);
+          nameHint = { folder, name: "main.pdf" };
+          const got = await grabFreshDownload(Date.now(), 8000);
+          nameHint = null;
+          if (got && got.ok) {
+            download = got;
+            pdf = clicked;
+            break;
+          }
+        }
       }
 
       // 验证通过后页面会重新渲染、给出新的 md5，所以每轮都取"没试过"的

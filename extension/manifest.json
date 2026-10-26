@@ -1,28 +1,28 @@
-{
-  "manifest_version": 3,
-  "name": "DOI 取件器",
-  "version": "0.7.8",
-  "description": "在论文页点一下，用你自己的浏览器登录态把全文和补充材料存到你指定的文件夹，并可一键存入 Zotero；支持批量取件与 WebVPN 网关改写。",
-  "permissions": ["activeTab", "scripting", "downloads", "storage", "offscreen", "notifications"],
-  "host_permissions": ["<all_urls>", "http://127.0.0.1:23119/*"],
-  "icons": {
-    "16": "icon16.png",
-    "32": "icon32.png",
-    "48": "icon48.png",
-    "128": "icon128.png"
-  },
-  "background": {
-    "service_worker": "background.js"
-  },
-  "action": {
-    "default_popup": "popup.html",
-    "default_title": "DOI 取件器",
-    "default_icon": {
-      "16": "icon16.png",
-      "32": "icon32.png",
-      "48": "icon48.png",
-      "128": "icon128.png"
-    }
-  }
-}
-
+{
+  "manifest_version": 3,
+  "name": "DOI 取件器",
+  "version": "0.7.9",
+  "description": "在论文页点一下，用你自己的浏览器登录态把全文和补充材料存到你指定的文件夹，并可一键存入 Zotero；支持批量取件与 WebVPN 网关改写。",
+  "permissions": ["activeTab", "scripting", "downloads", "storage", "offscreen", "notifications"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:23119/*"],
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon32.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "DOI 取件器",
+    "default_icon": {
+      "16": "icon16.png",
+      "32": "icon32.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  }
+}
+
