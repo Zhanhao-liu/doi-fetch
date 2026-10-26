@@ -471,6 +471,17 @@ function extractPageInfo() {
     if (!pdfs.includes(clean) && pdfHint(clean)) pdfs.push(clean);
   }
 
+  // 兜底：ScienceDirect 的下载按钮有时不是 <a href>，页面上找不到 PDF 链接时
+  // 用 PII 拼一个，保证"正文"这一项始终存在（有权限时会 302 到签名地址）。
+  if (!pdfs.length) {
+    const piiMatch = location.pathname.match(/\/pii\/([A-Za-z0-9]+)/);
+    if (piiMatch) {
+      addPdf(
+        location.origin + "/science/article/pii/" + piiMatch[1].toUpperCase() + "/pdfft"
+      );
+    }
+  }
+
   return {
     doi: doi || "",
     title: meta("citation_title") || document.title || "",

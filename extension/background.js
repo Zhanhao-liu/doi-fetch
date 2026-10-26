@@ -575,86 +575,26 @@ async function runDownloads(job) {
     const task = tasks[index];
     await emit({ index, total, name: task.label, state: "start" });
 
-    // 正文优先"点页面里自己的链接"：导航请求才带 Referer 和完整头，
-    // 出版社会把 downloads API / fetch 当成自动化抓取并回一张 HTML。
-    const gated = /sciencedirect\.com|elsevier\.com/i.test(task.url || "");
-    const isBody = index === 0 || /正文|main/i.test(task.label || "");
-
-    // 最优先：如果当前标签页本身就是 PDF（Elsevier 会跳到 pdf.sciencedirectassets.com
-    // 的预签名地址，自带 X-Amz-Signature，不需要 cookie/Referer），直接下它。
-    let direct = task.url;
-    let fromViewer = false;
-    if (isBody) {
+    // 唯一保留的增强：正文任务若当前标签页本身就是 PDF（Elsevier 会落到
+    // pdf.sciencedirectassets.com 的签名地址），优先用那个地址。
+    // 其余一律恢复成最朴素的行为：直接下载 → 等完成 → 报结果。
+    let target = task.url;
+    if (index === 0) {
       const viewerPdf = pdfUrlFromTabUrl(await activeTabUrl());
-      if (viewerPdf) {
-        direct = viewerPdf;
-        fromViewer = true;
-      }
+      if (viewerPdf) target = viewerPdf;
     }
-
-    if (gated && isBody && direct === task.url) {
-      nameHint = { folder: root, name: task.name };
-      const clicked = await clickInActiveTab();
-      if (clicked) {
-        await emit({ index, total, name: task.label, state: "start", note: "已在页面里点击 PDF 链接" });
-        const got = await grabFreshDownload(Date.now(), 25000);
-        nameHint = null;
-        if (got && got.ok) {
-          done += 1;
-          await emit({ index, total, name: task.label, state: "ok" });
-          continue;
-        }
-      } else {
-        nameHint = null;
-      }
-    }
-
-    // 探测只作参考：预签名地址对额外请求头/有效期待遇很差，探测失败不代表下不下来。
-    // 真正的裁决放在落盘之后（落成 .html 就删掉并说明）。
 
     try {
       const id = await startDownload({
-        url: direct,
+        url: target,
         filename: root + "/" + task.name,
         saveAs: false,
         conflictAction: "uniquify",
       });
       const state = await waitForDownload(id, 180000);
-
-      let record = null;
-      try {
-        const found = await chrome.downloads.search({ id });
-        record = (found && found[0]) || null;
-      } catch (err) {
-        record = null;
-      }
-      const saved = record ? String(record.filename || "").split(/[\\/]/).pop() : "";
-      const landedHtml = /\.html?$/i.test(saved);
-
-      if (state === "complete" && !landedHtml) {
+      if (state === "complete") {
         done += 1;
         await emit({ index, total, name: task.label, state: "ok" });
-      } else if (state === "complete" && landedHtml) {
-        // 存成网页说明拿到的是拦截页，删掉别留垃圾
-        try {
-          await chrome.downloads.removeFile(id);
-        } catch (err) {
-          /* ignore */
-        }
-        try {
-          await chrome.downloads.erase({ id });
-        } catch (err) {
-          /* ignore */
-        }
-        await emit({
-          index,
-          total,
-          name: task.label,
-          state: "fail",
-          error: fromViewer
-            ? "PDF 地址已失效（签名 URL 过期），请在页面上重新打开一次 PDF"
-            : "拿到的是网页不是 PDF，已删除",
-        });
       } else {
         await emit({
           index,
