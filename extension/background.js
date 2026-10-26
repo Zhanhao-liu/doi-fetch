@@ -997,8 +997,8 @@ function pdfVariants(url, base) {
   try {
     const parsed = new URL(url);
     const matched = parsed.pathname.match(/\/pii\/([A-Za-z0-9]+)/);
-    if (matched) {
-      const pii = matched[1].toUpperCase();
+    const pii = matched ? matched[1].toUpperCase() : "";
+    if (/^[A-Z0-9]{8,}$/.test(pii)) {
       const shapes = [
         "https://www.sciencedirect.com/science/article/pii/" + pii + "/pdfft?isDTMRedir=true&download=true",
         "https://www.sciencedirect.com/science/article/pii/" + pii + "/pdfft",
@@ -1064,6 +1064,7 @@ async function runBatch(dois, base) {
     let challenged = false;
     let lastInfo = null;
     let attempts = 0;
+    let viewerSeen = false;
     const tried = new Set();
     const deadline = Date.now() + BATCH_TIMEOUT_MS;
     let settleDeadline = 0;
@@ -1073,15 +1074,50 @@ async function runBatch(dois, base) {
 
       let info = null;
       try {
-        const [result] = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
+        // 所有 frame 都嗅一遍：有些出版社会把 PDF 嵌在 iframe 里
+        const frames = await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
           func: sniffPage,
         });
-        info = result && result.result;
+        const found = (frames || [])
+          .map((frame) => frame && frame.result)
+          .filter(Boolean)
+          .sort(
+            (a, b) =>
+              (b.links || []).length + (b.si || []).length -
+              ((a.links || []).length + (a.si || []).length)
+          );
+        info = found[0] || null;
       } catch (err) {
-        info = null; // 页面正在跳转
+        info = null; // 页面正在跳转，或已经变成 PDF 阅读器（插件文档，无法注入）
       }
-      if (!info) continue;
+
+      if (!info) {
+        // 阅读器出现了：注入一定失败，但 PDF 就在这个标签页里 —— 直接从它的
+        // 地址再取一次（此时会话已通过验证，请求多半能成功）
+        let tabUrl = "";
+        try {
+          tabUrl = (await chrome.tabs.get(tab.id)).url || "";
+        } catch (err) {
+          tabUrl = "";
+        }
+        if (/\/pdfft|\.pdf(\?|$)/i.test(tabUrl)) {
+          viewerSeen = true;
+          const viewerUrls = pdfVariants(tabUrl, base).filter((url) => !tried.has(url));
+          for (const url of viewerUrls) tried.add(url);
+          for (const url of viewerUrls) {
+            const got = await downloadVerified(url, folder + "/main.pdf", true);
+            if (got.ok) {
+              download = got;
+              pdf = url;
+              break;
+            }
+            if (!(download && download.ok)) download = got;
+          }
+          if (download && download.ok) break;
+        }
+        continue;
+      }
 
       // 卡在验证页 / 网关登录页：等人操作，但**绝不动这个标签页**
       const needsHuman =
@@ -1207,7 +1243,17 @@ async function runBatch(dois, base) {
         if (got.ok) item.si.push(got.name);
       }
       const why = (download && download.reason) || "没找到可用的 PDF 链接";
-      if (item.si.length) {
+      if (viewerSeen) {
+        // 阅读器出现过，说明页面本身是通的，只是我们拿不到字节
+        item.status = "manual";
+        item.detail =
+          "PDF 已在标签页的阅读器里打开，但程序取不到字节（" + why +
+          "）。请在阅读器里点下载按钮，存到 " + folder + "/main.pdf";
+        if (item.si.length) item.detail += "（补充材料 " + item.si.length + " 个已保存）";
+      } else if (challenged) {
+        item.status = "failed";
+        item.detail = "一直停在验证页，没能进到文章页（验证未完成或没有访问权限）";
+      } else if (item.si.length) {
         item.status = "partial";
         item.detail = "正文拿不到（" + why + "），已取回补充材料 " + item.si.length + " 个";
       } else {
