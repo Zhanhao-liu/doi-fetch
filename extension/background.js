@@ -512,6 +512,37 @@ function waitForDownload(id, timeoutMs) {
   });
 }
 
+/**
+ * 从标签页地址里取出真正的 PDF 地址。
+ *
+ * Chrome 内置 PDF 阅读器的 url 常常是
+ *   chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html?file=<编码后的地址>
+ * 之前用 startsWith("chrome-extension://") 一刀切跳过，等于把最可靠的线索丢了。
+ */
+function pdfUrlFromTabUrl(url) {
+  const raw = String(url || "");
+  if (!raw) return "";
+  if (/^chrome-extension:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw);
+      const file = parsed.searchParams.get("file");
+      if (file) return file;
+    } catch (err) {
+      /* ignore */
+    }
+    const hashMatch = raw.match(/[#&]file=([^&]+)/);
+    if (hashMatch) {
+      try {
+        return decodeURIComponent(hashMatch[1]);
+      } catch (err) {
+        return "";
+      }
+    }
+    return "";
+  }
+  return /\.pdf(\?|$)/i.test(raw) ? raw : "";
+}
+
 async function activeTabUrl() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -552,10 +583,12 @@ async function runDownloads(job) {
     // 最优先：如果当前标签页本身就是 PDF（Elsevier 会跳到 pdf.sciencedirectassets.com
     // 的预签名地址，自带 X-Amz-Signature，不需要 cookie/Referer），直接下它。
     let direct = task.url;
+    let fromViewer = false;
     if (isBody) {
-      const current = await activeTabUrl();
-      if (/\.pdf(\?|$)/i.test(current) && !current.startsWith("chrome-extension://")) {
-        direct = current;
+      const viewerPdf = pdfUrlFromTabUrl(await activeTabUrl());
+      if (viewerPdf) {
+        direct = viewerPdf;
+        fromViewer = true;
       }
     }
 
@@ -576,18 +609,8 @@ async function runDownloads(job) {
       }
     }
 
-    // 下载前先看内容类型：链接指向网页（补充材料的说明页、拦截页）就别下了
-    const before = await probeDocument(direct);
-    if (before.kind === "html") {
-      await emit({
-        index,
-        total,
-        name: task.label,
-        state: "fail",
-        error: "链接指向的是网页而不是文件，已跳过",
-      });
-      continue;
-    }
+    // 探测只作参考：预签名地址对额外请求头/有效期待遇很差，探测失败不代表下不下来。
+    // 真正的裁决放在落盘之后（落成 .html 就删掉并说明）。
 
     try {
       const id = await startDownload({
@@ -628,7 +651,9 @@ async function runDownloads(job) {
           total,
           name: task.label,
           state: "fail",
-          error: "拿到的是网页不是 PDF，已删除",
+          error: fromViewer
+            ? "PDF 地址已失效（签名 URL 过期），请在页面上重新打开一次 PDF"
+            : "拿到的是网页不是 PDF，已删除",
         });
       } else {
         await emit({
