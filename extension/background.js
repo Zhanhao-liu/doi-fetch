@@ -983,6 +983,36 @@ async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate
   return { ok: false, reason: "等待超时（页面可能仍需人工验证）", tried, gate: gateReported };
 }
 
+/**
+ * 生成候选 PDF 地址。
+ *
+ * 页面里的 /pdfft 链接带 md5，而 md5 是**页面加载时生成**的；人工验证后页面
+ * 重新渲染，旧 md5 就失效了（表现为一直 403）。所以除了原样使用，再按 PII
+ * 拼两种干净地址（这是 metapub/findit 的做法）：
+ *   /science/article/pii/{PII}/pdfft?isDTMRedir=true&download=true
+ *   /science/article/pii/{PII}/pdfft
+ */
+function pdfVariants(url, base) {
+  const out = [url];
+  try {
+    const parsed = new URL(url);
+    const matched = parsed.pathname.match(/\/pii\/([A-Za-z0-9]+)/);
+    if (matched) {
+      const pii = matched[1].toUpperCase();
+      const shapes = [
+        "https://www.sciencedirect.com/science/article/pii/" + pii + "/pdfft?isDTMRedir=true&download=true",
+        "https://www.sciencedirect.com/science/article/pii/" + pii + "/pdfft",
+      ];
+      for (const shape of shapes) {
+        out.push(base ? DOIWebVPN.convert(shape, base) : shape);
+      }
+    }
+  } catch (err) {
+    /* ignore */
+  }
+  return Array.from(new Set(out));
+}
+
 async function runBatch(dois, base) {
   const state = {
     id: "b" + Date.now().toString(36),
@@ -1026,14 +1056,21 @@ async function runBatch(dois, base) {
       continue;
     }
 
+    const folder = state.root + "/" + doiSlug(item.doi);
+    item.si = item.si || [];
+
     let pdf = "";
+    let download = null;
     let challenged = false;
     let lastInfo = null;
+    let attempts = 0;
+    const tried = new Set();
     const deadline = Date.now() + BATCH_TIMEOUT_MS;
     let settleDeadline = 0;
 
     while (Date.now() < deadline) {
       await sleep(1500);
+
       let info = null;
       try {
         const [result] = await chrome.scripting.executeScript({
@@ -1042,10 +1079,11 @@ async function runBatch(dois, base) {
         });
         info = result && result.result;
       } catch (err) {
-        info = null; // 页面正在跳转，下一轮再看
+        info = null; // 页面正在跳转
       }
       if (!info) continue;
 
+      // 卡在验证页 / 网关登录页：等人操作，但**绝不动这个标签页**
       const needsHuman =
         DOIWebVPN.isChallengeTitle(info.title) || DOIWebVPN.isLoginUrl(info.url);
       if (needsHuman) {
@@ -1074,86 +1112,108 @@ async function runBatch(dois, base) {
       }
 
       lastInfo = info;
-      pdf = pickPdfUrl(info, base);
-      if (pdf) break;
-
-      // 页面已经加载完却没有 PDF 链接：多半是付费墙，别干等到超时
-      if (info.ready === "complete" && !settleDeadline) {
-        settleDeadline = Date.now() + 25000;
+      const candidate = pickPdfUrl(info, base);
+      if (!candidate) {
+        if (info.ready === "complete" && !settleDeadline) settleDeadline = Date.now() + 20000;
+        if (settleDeadline && Date.now() > settleDeadline) break;
+        continue;
       }
-      if (settleDeadline && Date.now() > settleDeadline) break;
+
+      // 验证通过后页面会重新渲染、给出新的 md5，所以每轮都取"没试过"的
+      const fresh = pdfVariants(candidate, base).filter((url) => !tried.has(url));
+      if (!fresh.length) {
+        if (!settleDeadline) settleDeadline = Date.now() + 15000;
+        if (Date.now() > settleDeadline) break;
+        continue;
+      }
+      for (const url of fresh) tried.add(url);
+      attempts += 1;
+
+      for (const url of fresh) {
+        const got = await downloadVerified(url, folder + "/main.pdf", true);
+        if (got.ok) {
+          download = got;
+          pdf = url;
+          break;
+        }
+        download = download && download.ok ? download : got;
+      }
+      if (download && download.ok) break;
+
+      item.detail =
+        "第 " + attempts + " 次尝试没成功（" +
+        ((download && download.reason) || "未知") +
+        "），继续等页面刷新…";
+      await writeBatch(state);
+      if (attempts >= 3) break;
     }
 
-    const folder = state.root + "/" + doiSlug(item.doi);
-    item.si = item.si || [];
-
-    if (pdf) {
-      // Elsevier 的 /pdfft 后面是反爬中间页，只有真实导航才放行；
-      // 其它出版商用校验下载即可（内联 PDF 在浏览器里打开，不会触发下载事件）
-      const gatedHost = /sciencedirect\.com|elsevier\.com/i.test(pdf);
-      const main = gatedHost
-        ? await downloadViaNavigation(
-        tab.id,
-        pdf,
-        folder,
-        "main.pdf",
-        90000,
-        async () => {
-          item.status = "challenge";
-          item.detail = "页面有反爬中间页，已切到该标签页：点一下确认后会自动继续";
-          await writeBatch(state);
-          notifyBatch("第 " + (index + 1) + " 篇需要在标签页里点一下");
+    // 直接下载都不行时，最后再试一次"另开标签页导航"，避免占用文章页
+    if (!(download && download.ok) && pdf) {
+      try {
+        const helper = await chrome.tabs.create({ url: "about:blank", active: false });
+        const navigated = await downloadViaNavigation(
+          helper.id,
+          pdf,
+          folder,
+          "main.pdf",
+          60000,
+          async () => {
+            item.status = "challenge";
+            item.detail = "需要在弹出的标签页里点一下确认，之后会自动继续";
+            await writeBatch(state);
+          }
+        );
+        try {
+          await chrome.tabs.remove(helper.id);
+        } catch (err) {
+          /* ignore */
         }
-      )
-        : await downloadVerified(pdf, folder + "/main.pdf", true);
-      if (main.ok) {
-        item.status = "downloaded";
-        item.pdf = pdf;
-        item.saved = main.name;
-
-        const siUrls = pickSiUrls(lastInfo, base, pdf);
-        for (let n = 0; n < siUrls.length && n < 10; n += 1) {
-          const got = await downloadVerified(
-            siUrls[n],
-            folder + "/" + siFilename(siUrls[n], n + 1),
-            false
-          );
-          if (got.ok) item.si.push(got.name);
-        }
-        item.detail =
-          "正文已保存" +
-          (item.si.length ? "，补充材料 " + item.si.length + " 个" : "，未发现补充材料");
-        await writeBatch(state);
-      } else {
-        // 正文拿不到，但很多补充材料挂在公开 CDN 上，值得单独试一次
-        const siUrls = pickSiUrls(lastInfo, base, "");
-        for (let n = 0; n < siUrls.length && n < 10; n += 1) {
-          const got = await downloadVerified(
-            siUrls[n],
-            folder + "/" + siFilename(siUrls[n], n + 1),
-            false
-          );
-          if (got.ok) item.si.push(got.name);
-        }
-        if (main.manual) {
-          // PDF 能打开但不能直接保存：把标签页留着，让用户点阅读器的下载按钮
-          item.status = "manual";
-          item.detail = main.reason;
-        } else if (item.si.length) {
-          item.status = "partial";
-          item.detail =
-            "正文拿不到（" + main.reason + "），已取回补充材料 " + item.si.length + " 个";
-        } else {
-          item.status = "failed";
-          item.detail = "正文拿不到（" + main.reason + "），也没有可下载的补充材料";
-        }
+        if (navigated && navigated.ok) download = navigated;
+        else if (navigated && navigated.manual && !(download && download.ok)) download = navigated;
+      } catch (err) {
+        /* ignore */
       }
-    } else if (challenged) {
+    }
+
+    if (download && download.ok) {
+      item.status = "downloaded";
+      item.pdf = pdf;
+      item.saved = download.name;
+
+      const siUrls = pickSiUrls(lastInfo, base, pdf);
+      for (let n = 0; n < siUrls.length && n < 10; n += 1) {
+        const got = await downloadVerified(
+          siUrls[n],
+          folder + "/" + siFilename(siUrls[n], n + 1),
+          false
+        );
+        if (got.ok) item.si.push(got.name);
+      }
+      item.detail =
+        "正文已保存" + (item.si.length ? "，补充材料 " + item.si.length + " 个" : "");
+      await writeBatch(state);
+    } else if (download && download.manual) {
       item.status = "manual";
-      item.detail = "验证未完成，标签页保留着，可以手动下载";
+      item.detail = download.reason;
     } else {
-      item.status = "failed";
-      item.detail = "没找到 PDF 链接（可能需要机构权限）";
+      const siUrls = pickSiUrls(lastInfo, base, "");
+      for (let n = 0; n < siUrls.length && n < 10; n += 1) {
+        const got = await downloadVerified(
+          siUrls[n],
+          folder + "/" + siFilename(siUrls[n], n + 1),
+          false
+        );
+        if (got.ok) item.si.push(got.name);
+      }
+      const why = (download && download.reason) || "没找到可用的 PDF 链接";
+      if (item.si.length) {
+        item.status = "partial";
+        item.detail = "正文拿不到（" + why + "），已取回补充材料 " + item.si.length + " 个";
+      } else {
+        item.status = "failed";
+        item.detail = "正文拿不到（" + why + "）";
+      }
     }
     await writeBatch(state);
 
