@@ -822,36 +822,25 @@ function looksLikeGate(status) {
   );
 }
 
-/**
- * 导航到 PDF 地址后取回文件。
- *
- * Elsevier 的 /pdfft 后面是反爬中间页，只有真实导航才会放行；而放行之后 PDF 往往
- * 是**内联打开**在标签页里（Chrome 阅读器），不会触发下载事件——所以不能只等
- * downloads。这里三条路并行推进：
- *   1. 浏览器自己发起了下载     → 直接收
- *   2. 页面不是中间页了         → 主动下载一次（验证通过后请求就会成功）
- *   3. 还是中间页               → 切到前台提示用户点一下
- */
-async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate) {
-  const startedAt = Date.now();
-  nameHint = { folder, name };
-
+/** 给出版商地址加上"以附件形式下载"的参数（Elsevier 支持 download=true） */
+function withDownloadFlag(url) {
   try {
-    await chrome.tabs.update(tabId, { url });
+    const parsed = new URL(url);
+    parsed.searchParams.set("download", "true");
+    if (/sciencedirect\.com/.test(parsed.hostname)) {
+      parsed.searchParams.set("isDTMRedir", "true");
+    }
+    return parsed.toString();
   } catch (err) {
-    nameHint = null;
-    return { ok: false, reason: "打不开 PDF 地址" };
+    return url + (url.indexOf("?") >= 0 ? "&" : "?") + "download=true";
   }
+}
 
+/** 等一次新的浏览器下载落地（最多 timeoutMs） */
+async function grabFreshDownload(startedAt, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
-  let gateReported = false;
-  let lastTry = 0;
-  let lastReason = "";
-
   while (Date.now() < deadline) {
-    await sleepMs(1500);
-
-    // 1) 浏览器是否已经自己开始下载
+    await sleepMs(1200);
     let recent = [];
     try {
       recent = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 3 });
@@ -861,24 +850,103 @@ async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate
     const fresh = recent.find(
       (item) => item.startTime && Date.parse(item.startTime) >= startedAt - 2000
     );
-    if (fresh) {
-      const outcome = await waitForDownload(fresh.id, 180000);
+    if (!fresh) continue;
+
+    const outcome = await waitForDownload(fresh.id, 180000);
+    const saved = String(fresh.filename || "").split(/[\\/]/).pop();
+    if (outcome === "complete" && !/\.html?$/i.test(saved)) {
+      return { ok: true, name: saved, size: fresh.fileSize || 0 };
+    }
+    if (outcome !== "complete") {
+      return { ok: false, reason: outcome === "timeout" ? "下载超时" : "下载中断" };
+    }
+    return { ok: false, reason: "落盘成了网页（" + saved + "）" };
+  }
+  return null;
+}
+
+/**
+ * 取回被中间页保护的 PDF。
+ *
+ * 实测结论：Elsevier 的 /pdfft 对 fetch / downloads API 一律返回 403（页面里还带
+ * tdm-reservation 声明），但**浏览器导航**能正常打开 PDF —— 只是内联显示在阅读器
+ * 里，不会触发下载事件。所以按下面的顺序逐级尝试，并把每一步结果写进诊断：
+ *
+ *   1. 带 download=true 导航（让服务端返回 attachment，触发真正的下载）
+ *   2. 带 download=true 直接下载
+ *   3. 正常导航（阅读器显示）后主动下载
+ *   4. 都失败 → 交给用户：PDF 已经打开，用阅读器的下载按钮保存
+ */
+async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate) {
+  const tried = [];
+  const attachName = () => { nameHint = { folder, name }; };
+
+  const attemptNavigate = async (target, label) => {
+    attachName();
+    const startedAt = Date.now();
+    try {
+      await chrome.tabs.update(tabId, { url: target });
+    } catch (err) {
       nameHint = null;
-      const saved = String(fresh.filename || "").split(/[\\/]/).pop();
-      if (outcome === "complete" && !/\.html?$/i.test(saved)) {
-        return { ok: true, name: saved, size: fresh.fileSize || 0 };
-      }
-      if (outcome !== "complete") {
-        return { ok: false, reason: outcome === "timeout" ? "下载超时" : "下载中断" };
-      }
-      return { ok: false, reason: "落盘成了网页（" + saved + "）" };
+      tried.push(label + ": 打不开");
+      return null;
+    }
+    const got = await grabFreshDownload(startedAt, 15000);
+    if (got && got.ok) {
+      nameHint = null;
+      return { ...got, via: label };
+    }
+    if (got && !got.ok) tried.push(label + ": " + got.reason);
+    return null;
+  };
+
+  // 1) 带 download=true 导航
+  const flagged = withDownloadFlag(url);
+  if (flagged !== url) {
+    const one = await attemptNavigate(flagged, "导航+download=true");
+    if (one) return one;
+  }
+
+  // 2) 带 download=true 直接下载
+  try {
+    const direct = await downloadVerified(flagged, folder + "/" + name, true);
+    if (direct.ok) {
+      nameHint = null;
+      return { ...direct, via: "直下+download=true" };
+    }
+    tried.push("直下+download=true: " + direct.reason);
+  } catch (err) {
+    tried.push("直下抛错");
+  }
+
+  // 3) 正常导航 → 等中间页消失 → 主动下载
+  const gateStart = Date.now();
+  attachName();
+  let gateReported = false;
+  try {
+    await chrome.tabs.update(tabId, { url });
+  } catch (err) {
+    nameHint = null;
+    return { ok: false, reason: "打不开 PDF 地址" };
+  }
+
+  const deadline = gateStart + timeoutMs;
+  let lastTry = 0;
+  let viewerSeen = false;
+
+  while (Date.now() < deadline) {
+    await sleepMs(1500);
+
+    const fresh = await grabFreshDownload(gateStart, 1);
+    if (fresh && fresh.ok) {
+      nameHint = null;
+      return { ...fresh, via: "导航后自动下载" };
     }
 
     const status = await pageStatus(tabId);
-    const blocked = looksLikeGate(status);
+    if (status === null) viewerSeen = true; // 注入失败 = 已经是 PDF 阅读器
 
-    // 3) 还停在中间页：提示用户，把标签页切到前台
-    if (blocked) {
+    if (looksLikeGate(status)) {
       if (!gateReported) {
         gateReported = true;
         try {
@@ -891,24 +959,28 @@ async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate
       continue;
     }
 
-    // 2) 中间页已经不在了（或已变成 PDF 阅读器，注入失败返回 null）→ 主动拉一次
     if (Date.now() - lastTry > 6000) {
       lastTry = Date.now();
       const direct = await downloadVerified(url, folder + "/" + name, true);
       if (direct.ok) {
         nameHint = null;
-        return direct;
+        return { ...direct, via: "阅读器就绪后主动下载" };
       }
-      lastReason = direct.reason || lastReason;
+      tried.push("主动下载: " + direct.reason);
     }
   }
 
   nameHint = null;
-  return {
-    ok: false,
-    reason: "等待超时" + (lastReason ? "（最后一次尝试：" + lastReason + "）" : ""),
-    gate: gateReported,
-  };
+  if (viewerSeen || !looksLikeGate(await pageStatus(tabId))) {
+    return {
+      ok: false,
+      manual: true,
+      reason: "PDF 已在标签页里打开，但无法直接保存：请在阅读器里点下载按钮（或 Ctrl+S）存到 " +
+        folder + "/" + name,
+      tried,
+    };
+  }
+  return { ok: false, reason: "等待超时（页面可能仍需人工验证）", tried, gate: gateReported };
 }
 
 async function runBatch(dois, base) {
@@ -1063,7 +1135,11 @@ async function runBatch(dois, base) {
           );
           if (got.ok) item.si.push(got.name);
         }
-        if (item.si.length) {
+        if (main.manual) {
+          // PDF 能打开但不能直接保存：把标签页留着，让用户点阅读器的下载按钮
+          item.status = "manual";
+          item.detail = main.reason;
+        } else if (item.si.length) {
           item.status = "partial";
           item.detail =
             "正文拿不到（" + main.reason + "），已取回补充材料 " + item.si.length + " 个";
