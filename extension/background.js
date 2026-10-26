@@ -512,6 +512,15 @@ function waitForDownload(id, timeoutMs) {
   });
 }
 
+async function activeTabUrl() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return (tab && tab.url) || "";
+  } catch (err) {
+    return "";
+  }
+}
+
 async function clickInActiveTab() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -539,7 +548,18 @@ async function runDownloads(job) {
     // 出版社会把 downloads API / fetch 当成自动化抓取并回一张 HTML。
     const gated = /sciencedirect\.com|elsevier\.com/i.test(task.url || "");
     const isBody = index === 0 || /正文|main/i.test(task.label || "");
-    if (gated && isBody) {
+
+    // 最优先：如果当前标签页本身就是 PDF（Elsevier 会跳到 pdf.sciencedirectassets.com
+    // 的预签名地址，自带 X-Amz-Signature，不需要 cookie/Referer），直接下它。
+    let direct = task.url;
+    if (isBody) {
+      const current = await activeTabUrl();
+      if (/\.pdf(\?|$)/i.test(current) && !current.startsWith("chrome-extension://")) {
+        direct = current;
+      }
+    }
+
+    if (gated && isBody && direct === task.url) {
       nameHint = { folder: root, name: task.name };
       const clicked = await clickInActiveTab();
       if (clicked) {
@@ -557,7 +577,7 @@ async function runDownloads(job) {
     }
 
     // 下载前先看内容类型：链接指向网页（补充材料的说明页、拦截页）就别下了
-    const before = await probeDocument(task.url);
+    const before = await probeDocument(direct);
     if (before.kind === "html") {
       await emit({
         index,
@@ -571,7 +591,7 @@ async function runDownloads(job) {
 
     try {
       const id = await startDownload({
-        url: task.url,
+        url: direct,
         filename: root + "/" + task.name,
         saveAs: false,
         conflictAction: "uniquify",
@@ -1296,6 +1316,28 @@ async function runBatch(dois, base) {
       }
 
       lastInfo = info;
+
+      // Elsevier 通过 /pdfft 跳到 pdf.sciencedirectassets.com 的预签名地址，
+      // 那个地址自带授权，直接下载即可 —— 比任何拼地址的办法都可靠。
+      let tabUrl = "";
+      try {
+        tabUrl = (await chrome.tabs.get(tab.id)).url || "";
+      } catch (err) {
+        tabUrl = "";
+      }
+      if (/\.pdf(\?|$)/i.test(tabUrl) && !tried.has(tabUrl)) {
+        tried.add(tabUrl);
+        item.detail = "检测到标签页里已经是 PDF，直接从该地址下载…";
+        await writeBatch(state);
+        const got = await downloadVerified(tabUrl, folder + "/main.pdf", true);
+        if (got.ok) {
+          download = got;
+          pdf = tabUrl;
+          break;
+        }
+        download = download && download.ok ? download : got;
+      }
+
       const candidate = pickPdfUrl(info, base);
       if (!candidate) {
         if (info.ready === "complete" && !settleDeadline) settleDeadline = Date.now() + 20000;
