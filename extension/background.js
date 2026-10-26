@@ -822,7 +822,16 @@ function looksLikeGate(status) {
   );
 }
 
-/** 导航到 PDF 地址，等浏览器自己下载。返回是否成功落盘。 */
+/**
+ * 导航到 PDF 地址后取回文件。
+ *
+ * Elsevier 的 /pdfft 后面是反爬中间页，只有真实导航才会放行；而放行之后 PDF 往往
+ * 是**内联打开**在标签页里（Chrome 阅读器），不会触发下载事件——所以不能只等
+ * downloads。这里三条路并行推进：
+ *   1. 浏览器自己发起了下载     → 直接收
+ *   2. 页面不是中间页了         → 主动下载一次（验证通过后请求就会成功）
+ *   3. 还是中间页               → 切到前台提示用户点一下
+ */
 async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate) {
   const startedAt = Date.now();
   nameHint = { folder, name };
@@ -836,11 +845,13 @@ async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate
 
   const deadline = Date.now() + timeoutMs;
   let gateReported = false;
+  let lastTry = 0;
+  let lastReason = "";
 
   while (Date.now() < deadline) {
     await sleepMs(1500);
 
-    // 浏览器是否已经开始下载
+    // 1) 浏览器是否已经自己开始下载
     let recent = [];
     try {
       recent = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 3 });
@@ -863,10 +874,12 @@ async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate
       return { ok: false, reason: "落盘成了网页（" + saved + "）" };
     }
 
-    // 卡在中间页 / 验证页 → 把标签页切到前台让人点一下
-    if (!gateReported) {
-      const status = await pageStatus(tabId);
-      if (looksLikeGate(status)) {
+    const status = await pageStatus(tabId);
+    const blocked = looksLikeGate(status);
+
+    // 3) 还停在中间页：提示用户，把标签页切到前台
+    if (blocked) {
+      if (!gateReported) {
         gateReported = true;
         try {
           await chrome.tabs.update(tabId, { active: true });
@@ -875,11 +888,27 @@ async function downloadViaNavigation(tabId, url, folder, name, timeoutMs, onGate
         }
         if (typeof onGate === "function") onGate();
       }
+      continue;
+    }
+
+    // 2) 中间页已经不在了（或已变成 PDF 阅读器，注入失败返回 null）→ 主动拉一次
+    if (Date.now() - lastTry > 6000) {
+      lastTry = Date.now();
+      const direct = await downloadVerified(url, folder + "/" + name, true);
+      if (direct.ok) {
+        nameHint = null;
+        return direct;
+      }
+      lastReason = direct.reason || lastReason;
     }
   }
 
   nameHint = null;
-  return { ok: false, reason: "等待超时（页面可能需要点一下验证）", gate: gateReported };
+  return {
+    ok: false,
+    reason: "等待超时" + (lastReason ? "（最后一次尝试：" + lastReason + "）" : ""),
+    gate: gateReported,
+  };
 }
 
 async function runBatch(dois, base) {
