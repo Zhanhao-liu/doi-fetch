@@ -665,6 +665,223 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
+/**
+ * 用 CDP 读浏览器自己导航拿到的 PDF 字节。
+ *
+ * 为什么：Cloudflare 只放行「文档类型」的导航请求，扩展的 fetch / downloads
+ * 请求会被 403（1.2MB 拦截页），而且 Sec-Fetch-Dest 这类头扩展改不了。
+ * 浏览器导航本身是成功的——那就挂上 debugger，让浏览器去导航，再从
+ * Network.getResponseBody 把字节读出来。
+ */
+/**
+ * 用 CDP 的 Fetch 域在「响应阶段」拦一次，直接读响应体。
+ *
+ * Network.getResponseBody 对内置 PDF 阅读器处理的响应经常拿不到体，
+ * 而 Fetch.requestPaused（requestStage: Response）能拿到，读完后放行。
+ */
+async function capturePdfViaFetchDomain(tabId, url, timeoutMs) {
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+  } catch (err) {
+    return { ok: false, error: "attach: " + String((err && err.message) || err).slice(0, 90) };
+  }
+
+  const state = { base64: "", error: "", seen: [] };
+
+  const onEvent = (source, method, params) => {
+    if (!source || source.tabId !== tabId) return;
+    if (method !== "Fetch.requestPaused") return;
+
+    const requestId = params.requestId;
+    const requestUrl = (params.request && params.request.url) || "";
+    const status = params.responseStatusCode || 0;
+    if (state.seen.length < 8) {
+      state.seen.push({ url: requestUrl.slice(0, 110), status });
+    }
+
+    if (status && !state.base64) {
+      chrome.debugger
+        .sendCommand(target, "Fetch.getResponseBody", { requestId })
+        .then((body) => {
+          let b64 = "";
+          if (body && body.base64Encoded && body.body) b64 = body.body;
+          else if (body && body.body) b64 = btoa(body.body);
+          if (b64 && b64.startsWith("JVBER")) state.base64 = b64;
+        })
+        .catch(() => {
+          /* ignore */
+        })
+        .finally(() => {
+          chrome.debugger
+            .sendCommand(target, "Fetch.continueRequest", { requestId })
+            .catch(() => {});
+        });
+      return;
+    }
+
+    // 请求阶段（还没响应）：直接放行
+    chrome.debugger.sendCommand(target, "Fetch.continueRequest", { requestId }).catch(() => {});
+  };
+
+  chrome.debugger.onEvent.addListener(onEvent);
+  try {
+    await chrome.debugger.sendCommand(target, "Fetch.enable", {
+      patterns: [
+        { urlPattern: "*.pdf*", requestStage: "Response" },
+        { urlPattern: "*sciencedirectassets*", requestStage: "Response" },
+      ],
+    });
+    await chrome.debugger.sendCommand(target, "Page.enable");
+    await chrome.debugger.sendCommand(target, "Page.navigate", { url });
+
+    const deadline = Date.now() + (timeoutMs || 45000);
+    while (Date.now() < deadline && !state.base64) {
+      await sleepMs(600);
+    }
+    for (let i = 0; i < 14 && !state.base64; i += 1) {
+      await sleepMs(500);
+    }
+  } catch (err) {
+    state.error = "navigate: " + String((err && err.message) || err).slice(0, 90);
+  } finally {
+    chrome.debugger.onEvent.removeListener(onEvent);
+    try {
+      await chrome.debugger.sendCommand(target, "Fetch.disable");
+    } catch (err) {
+      /* ignore */
+    }
+    try {
+      await chrome.debugger.detach(target);
+    } catch (err) {
+      /* ignore */
+    }
+  }
+
+  if (!state.base64) {
+    return { ok: false, error: state.error || "没拿到 PDF 响应体", seen: state.seen };
+  }
+  return { ok: true, base64: state.base64, seen: state.seen };
+}
+
+async function capturePdfViaDebugger(tabId, url, timeoutMs) {
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+  } catch (err) {
+    return { ok: false, error: "attach: " + String((err && err.message) || err).slice(0, 90) };
+  }
+
+  const state = {
+    base64: "",
+    error: "",
+    seen: [],        // 观察到的候选请求（用于追踪）
+    tried: new Map(), // requestId -> 已尝试
+  };
+
+  const takeBody = (requestId) => {
+    if (state.tried.has(requestId) || state.base64) return;
+    state.tried.set(requestId, true);
+    chrome.debugger
+      .sendCommand(target, "Network.getResponseBody", { requestId })
+      .then((body) => {
+        if (state.base64) return;
+        let b64 = "";
+        if (body && body.base64Encoded && body.body) b64 = body.body;
+        else if (body && body.body) b64 = btoa(body.body);
+        if (b64 && b64.startsWith("JVBER")) {
+          state.base64 = b64;
+        }
+      })
+      .catch(() => {
+        /* 拿不到就算了，继续等其它候选 */
+      });
+  };
+
+  const onEvent = (source, method, params) => {
+    if (!source || source.tabId !== tabId) return;
+
+    if (method === "Network.responseReceived") {
+      const response = params.response || {};
+      const u = response.url || "";
+      const mime = (response.mimeType || "").toLowerCase();
+      const isCandidate =
+        mime.includes("pdf") || looksLikeRealPdf(u) || /sciencedirectassets/i.test(u);
+      if (isCandidate && state.seen.length < 8) {
+        state.seen.push({ url: u.slice(0, 110), mime: mime.slice(0, 24), id: params.requestId });
+      }
+      return;
+    }
+
+    if (method === "Network.loadingFinished") {
+      // 任何候选请求结束都试着取一次体，只认以 %PDF- 开头的
+      if (state.seen.some((item) => item.id === params.requestId)) {
+        takeBody(params.requestId);
+      }
+    }
+  };
+
+  chrome.debugger.onEvent.addListener(onEvent);
+  try {
+    await chrome.debugger.sendCommand(target, "Network.enable");
+    await chrome.debugger.sendCommand(target, "Page.enable");
+    await chrome.debugger.sendCommand(target, "Page.navigate", { url });
+
+    const deadline = Date.now() + (timeoutMs || 40000);
+    while (Date.now() < deadline && !state.base64) {
+      await sleepMs(700);
+    }
+    for (let i = 0; i < 12 && !state.base64; i += 1) {
+      await sleepMs(500);
+    }
+  } catch (err) {
+    state.error = "navigate: " + String((err && err.message) || err).slice(0, 90);
+  } finally {
+    chrome.debugger.onEvent.removeListener(onEvent);
+    try {
+      await chrome.debugger.detach(target);
+    } catch (err) {
+      /* ignore */
+    }
+  }
+
+  if (!state.base64) {
+    return {
+      ok: false,
+      error: state.error || "没拿到 PDF 响应体",
+      seen: state.seen,
+    };
+  }
+  return { ok: true, base64: state.base64, seen: state.seen };
+}
+
+/** 把 base64 的 PDF 通过 offscreen 生成 Blob URL 再保存。 */
+async function saveBase64Pdf(base64, folder, name) {
+  const startedAt = Date.now();
+  let made = null;
+  try {
+    await ensureOffscreen();
+    made = await chrome.runtime.sendMessage({ type: "blobDownload", base64 });
+  } catch (err) {
+    return { ok: false, error: "offscreen: " + String((err && err.message) || err).slice(0, 100) };
+  }
+  if (!made || !made.ok || !made.objectUrl) {
+    return { ok: false, error: (made && made.error) || "未生成 Blob 地址" };
+  }
+  try {
+    await startDownload({
+      url: made.objectUrl,
+      filename: folder + "/" + name,
+      saveAs: false,
+      conflictAction: "uniquify",
+    });
+  } catch (err) {
+    return { ok: false, error: "下载失败: " + String((err && err.message) || err).slice(0, 100) };
+  }
+  const done = await waitForNewDownload(startedAt, 90000);
+  return { ok: done.ok, file: done.filename.slice(-40) };
+}
+
 async function savePdfFromServiceWorker(url, folder, name) {
   const startedAt = Date.now();
   const attempts = [];
@@ -1034,6 +1251,34 @@ async function runDownloads(job) {
       if (viewerPdf) {
         // 先试页面内取字节 + Blob 保存（绕开下载请求被拦的问题）
         const tabId = activeTab && activeTab.id >= 0 ? activeTab.id : -1;
+
+        // 方案零：CDP 拦截浏览器自身导航的响应（能绕过 Cloudflare 的请求类型检查）
+        if (tabId >= 0) {
+          await emit({
+            index,
+            total,
+            name: task.label,
+            state: "start",
+            note: "用浏览器自身导航取回 PDF…",
+          });
+          const cdp = await capturePdfViaFetchDomain(tabId, viewerPdf, 45000);
+          if (cdp.ok) {
+            note("CDP: 成功 " + Math.round((cdp.base64.length * 3) / 4 / 1024) + "KB");
+            const saved = await saveBase64Pdf(cdp.base64, root, task.name);
+            if (saved.ok) {
+              done += 1;
+              await emit({ index, total, name: task.label, state: "ok" });
+              await persist();
+              continue;
+            }
+            note("CDP 保存失败: " + String(saved.error).slice(0, 100));
+          } else {
+            note(
+              "CDP: " + String(cdp.error).slice(0, 80) +
+                " seen=" + JSON.stringify(cdp.seen || []).slice(0, 140)
+            );
+          }
+        }
 
         // 方案一：后台 fetch + Blob（不受跨域限制，也不走服务器）
         await emit({

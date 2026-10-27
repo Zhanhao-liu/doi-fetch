@@ -1,0 +1,20 @@
+﻿feat(ext): 用 CDP 读浏览器自身导航拿到的 PDF 字节（0.11.0）
+
+用户提供的追踪揭示了真实原因：签名地址本身没问题，但扩展发出的一切请求都被
+Cloudflare 回 403 + 1.21MB 拦截页（type: text/html）。边界是 Sec-Fetch-Dest ——
+只有「文档类型」的导航请求才放行，而这类请求头扩展改不了（DNR 也不行）。
+
+解法：让浏览器自己去导航（这条一定通），再用 chrome.debugger 的 Fetch 域在响应
+阶段拦下来读响应体。
+
+实现要点：
+- capturePdfViaFetchDomain：attach → Fetch.enable(patterns: *.pdf*,
+  *sciencedirectassets*) → Page.navigate → 在 Fetch.requestPaused 的响应阶段
+  调 Fetch.getResponseBody → 只接受以 JVBER（%PDF-）开头的响应体 → 放行 → detach
+- 试过 Network.getResponseBody，对内嵌 PDF 阅读器处理的响应拿不到体，改用 Fetch 域
+- saveBase64Pdf：base64 → offscreen 生成 Blob URL → 下载器保存（纯本地）
+- Elsevier 正文顺序：CDP 捕获 → 后台 fetch → 页面 fetch → 直下
+- manifest 增加 debugger 权限
+
+验证：CDP 捕获 Nature PDF 得到 3170KB 并以 %PDF- 落盘；完整回归 3 个文件全部
+%PDF-，popup 无报错。
