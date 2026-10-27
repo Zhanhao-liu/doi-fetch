@@ -1,0 +1,13 @@
+﻿fix(ext): 过滤非法 URL；诊断显示中间页解析结果（0.8.4）
+
+用户报「Invalid URL」且附件也抓不到。原因：ScienceDirect 的 #pdfLink 有时是
+javascript:void(0) 或 #，我上一版把它排到 pdfs 第一位，正文任务的 URL 因此变成
+非法字符串，chrome.downloads 直接抛 Invalid URL。
+
+- popup：addPdf 只接受 /^https?:/，其余一律丢弃
+- background：中间页解析出的地址统一用 new URL(raw, location.href) 规范化，
+  失败返回空；下载前再校验一次 target，非法则回退到原始任务地址；
+  仍非法就报"页面里没有可用的下载地址"而不是 Invalid URL
+- 诊断新增「Elsevier 中间页解析」一行，直接显示是否解析到跳转地址
+
+回归：Nature / PLOS / Springer 正常（正文 PDF + 附件，popup 无报错）。

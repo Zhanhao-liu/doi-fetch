@@ -568,19 +568,34 @@ async function elsevierResolveIntermediate(url) {
       text.match(/http-equiv=["']?refresh["']?[^>]*?content=["']?\s*\d+\s*;\s*url=([^"'>\s]+)/i) ||
       text.match(/content=["']?\s*\d+\s*;\s*url=([^"'>\s]+)/i);
     if (metaMatch) {
-      return metaMatch[1].replace(/&amp;/g, "&");
+      const raw = metaMatch[1].replace(/&amp;/g, "&");
+      try {
+        return new URL(raw, location.href).href; // 相对地址也能变成合法绝对地址
+      } catch (err) {
+        return "";
+      }
     }
 
     // 2) DOM 兜底
     const doc = new DOMParser().parseFromString(text, "text/html");
     const anchor = doc.querySelector("#redirect-message a");
     if (anchor && anchor.getAttribute("href")) {
-      return new URL(anchor.getAttribute("href"), location.href).href;
+      try {
+        return new URL(anchor.getAttribute("href"), location.href).href;
+      } catch (err) {
+        return "";
+      }
     }
     const refresh = doc.querySelector('meta[http-equiv="Refresh"], meta[http-equiv="refresh"]');
     if (refresh && refresh.getAttribute("content")) {
       const inner = refresh.getAttribute("content").match(/url=(.+)$/i);
-      if (inner) return inner[1].trim();
+      if (inner) {
+        try {
+          return new URL(inner[1].trim(), location.href).href;
+        } catch (err) {
+          return "";
+        }
+      }
     }
     return "";
   } catch (err) {
@@ -652,6 +667,19 @@ async function runDownloads(job) {
         const resolved = await resolveElsevierPdf(page.id, target);
         if (resolved && resolved !== target) target = resolved;
       }
+    }
+
+    // 兜底：target 必须是合法 http(s)，否则回退到原始任务地址
+    if (!/^https?:/i.test(target || "")) target = task.url;
+    if (!/^https?:/i.test(target || "")) {
+      await emit({
+        index,
+        total,
+        name: task.label,
+        state: "fail",
+        error: "页面里没有可用的下载地址（拿到的是 " + String(task.url || "").slice(0, 40) + "）",
+      });
+      continue;
     }
 
     try {
@@ -1616,6 +1644,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             }
           } catch (err) {
             rows.push({ url: "[页面上下文] " + first.slice(0, 120), kind: "error", contentType: "", reason: String(err && err.message) });
+          }
+        }
+
+        // Elsevier：把中间页解析结果也报出来，便于判断卡在哪一步
+        if (tabId && urls.length) {
+          let first = String(urls[0]).trim();
+          if (base && /^https?:\/\//i.test(first) && !first.startsWith(base)) {
+            first = DOIWebVPN.convert(first, base);
+          }
+          if (/sciencedirect|elsevier/i.test(first)) {
+            const resolved = await resolveElsevierPdf(tabId, first);
+            rows.push({
+              url: "[Elsevier 中间页解析]",
+              kind: resolved ? "resolved" : "empty",
+              contentType: "",
+              reason: resolved || "没解析到跳转地址（说明拿到的不是中间页）",
+            });
           }
         }
 

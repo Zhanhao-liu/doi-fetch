@@ -432,7 +432,9 @@ function extractPageInfo() {
   const addPdf = (href) => {
     if (!href) return;
     const clean = href.split("#")[0];
-    if (clean && !pdfs.includes(clean)) pdfs.push(clean);
+    // 只认真实的 http(s) 地址：ScienceDirect 的 #pdfLink 有时是 javascript:void(0)
+    if (!/^https?:/i.test(clean)) return;
+    if (!pdfs.includes(clean)) pdfs.push(clean);
   };
   addPdf(meta("citation_pdf_url"));
   addPdf(meta("bepress_citation_pdf_url"));
