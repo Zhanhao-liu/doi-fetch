@@ -571,6 +571,7 @@ function pdfUrlFromTabUrl(url) {
  * 即使有 tabs 权限也可能读不到 tab.url。而网络层一定能看到真实请求，
  * 所以这里兜一层——标签页地址取不到时，用最近一次请求的 PDF 地址。 */
 const recentPdfByTab = new Map();
+let recentPdfLast = { url: "", at: 0 };
 
 try {
   chrome.webRequest.onBeforeRequest.addListener(
@@ -581,7 +582,9 @@ try {
       // 注意：不能按 sciencedirectassets.com 域名判断——那个域名同时托管网站的
       // JS/CSS/字体（例如 ai-components.js），曾因此把正文下载成 .js 文件。
       if (/\.pdf(\?|$)/i.test(url)) {
-        recentPdfByTab.set(details.tabId, { url, at: Date.now() });
+        const at = Date.now();
+        recentPdfByTab.set(details.tabId, { url, at });
+        recentPdfLast = { url, at };
       }
     },
     { urls: ["<all_urls>"] }
@@ -595,6 +598,48 @@ function recentPdfForTab(tabId) {
   if (!hit) return "";
   if (Date.now() - hit.at > 10 * 60 * 1000) return "";
   return hit.url || "";
+}
+
+/**
+ * 开一个后台标签页去请求指定地址，从网络请求里截下真正的 PDF 地址。
+ *
+ * 为什么需要：Elsevier 的 View PDF 会把人弹回文章页（?ref=pdf_download），
+ * PDF 不会留在标签页里；但网络层一定看得到那次 .pdf 请求（含重定向后的
+ * pdf.sciencedirectassets.com 签名地址）。这里就靠 webRequest 截它。
+ */
+async function capturePdfViaNavigation(url, timeoutMs, active) {
+  const start = Date.now();
+  let tabId = -1;
+  try {
+    const tab = await chrome.tabs.create({ url, active: !!active });
+    tabId = tab && tab.id >= 0 ? tab.id : -1;
+  } catch (err) {
+    return "";
+  }
+
+  const deadline = start + (timeoutMs || 25000);
+  let found = "";
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const perTab = tabId >= 0 ? recentPdfForTab(tabId) : "";
+    if (perTab) {
+      found = perTab;
+      break;
+    }
+    if (recentPdfLast.at > start && recentPdfLast.url) {
+      found = recentPdfLast.url;
+      break;
+    }
+  }
+
+  if (tabId >= 0) {
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch (err) {
+      /* ignore */
+    }
+  }
+  return found;
 }
 
 async function activeTabUrl() {
@@ -659,6 +704,30 @@ async function runDownloads(job) {
       let viewerPdf = pdfUrlFromTabUrl((activeTab && (activeTab.url || activeTab.pendingUrl)) || "");
       if (!viewerPdf && activeTab && activeTab.id >= 0) {
         viewerPdf = recentPdfForTab(activeTab.id); // 地址读不到时用网络记录
+      }
+      if (!viewerPdf && recentPdfLast.at > Date.now() - 5 * 60 * 1000) {
+        viewerPdf = recentPdfLast.url; // 最近 5 分钟内任何地方出现过的 PDF
+      }
+      if (!viewerPdf) {
+        await emit({
+          index,
+          total,
+          name: task.label,
+          state: "start",
+          note: "正在后台请求 PDF，从网络层截取真实地址…",
+        });
+        // 先后台试（不打扰），不行再用前台标签页（保证 JS 挑战能跑起来）
+        viewerPdf = await capturePdfViaNavigation(task.url, 20000, false);
+        if (!viewerPdf) {
+          await emit({
+            index,
+            total,
+            name: task.label,
+            state: "start",
+            note: "后台没截到，改用前台标签页再试一次…",
+          });
+          viewerPdf = await capturePdfViaNavigation(task.url, 25000, true);
+        }
       }
       if (viewerPdf) {
         target = viewerPdf;

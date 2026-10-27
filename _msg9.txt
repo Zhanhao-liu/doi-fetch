@@ -1,0 +1,19 @@
+﻿feat(ext): Elsevier 正文改为后台导航 + 网络层截获 PDF 地址（0.9.5）
+
+用户的报错显示：点 View PDF 之后标签页地址是
+  /science/article/pii/XXX?ref=pdf_download&fr=RR-2&...
+也就是 Elsevier 把人弹回了文章页，PDF 并不会留在标签页里。所以"先打开 PDF
+再点下载"这条指引本身不可靠。
+
+改为：扩展自己开一个后台标签页请求 PDF 地址，用 webRequest 截下真正发出的
+.pdf 请求（含重定向到 pdf.sciencedirectassets.com 的签名地址），再用该地址
+下载。后台标签页被节流时，自动改用前台标签页重试一次。
+
+实现：
+- recentPdfLast 记录全局最近一次 .pdf 请求
+- capturePdfViaNavigation(url, timeout, active)：开标签页 → 等网络记录 →
+  关闭标签页 → 返回截获到的地址
+- Elsevier 正文取值顺序：标签页地址 → 该标签页记录 → 5 分钟内全局记录 →
+  后台截获(20s) → 前台截获(25s)
+
+验证：后台导航截获到 .pdf 地址，下载完成，落盘 3170KB %PDF-。
