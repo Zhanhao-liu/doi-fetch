@@ -96,7 +96,32 @@ async function runJob(job) {
   });
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+
+/** 在 offscreen 文档里把字节做成 Blob URL 并交给下载器。
+ *  Service Worker 里没有 URL.createObjectURL，所以这一步必须放在这里。 */
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function makeBlobUrl(base64) {
+  try {
+    const bytes = base64ToBytes(base64);
+    const blob = new Blob([bytes], { type: "application/pdf" });
+    return { ok: true, objectUrl: URL.createObjectURL(blob), size: bytes.length };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err).slice(0, 160) };
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.type === "blobDownload") {
+    makeBlobUrl(message.base64).then((result) => sendResponse(result));
+    return true; // 异步响应
+  }
+
   if (message && message.type === "run") {
     runJob(message.job).catch((err) =>
       report({ state: "fail", done: 0, total: 0, error: String(err) })

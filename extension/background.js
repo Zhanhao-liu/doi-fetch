@@ -625,6 +625,152 @@ function recentPdfForTab(tabId) {
  * PDF 不会留在标签页里；但网络层一定看得到那次 .pdf 请求（含重定向后的
  * pdf.sciencedirectassets.com 签名地址）。这里就靠 webRequest 截它。
  */
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 等一个新的下载结束（按 startTime 判定），比 grabFreshDownload 更稳。 */
+async function waitForNewDownload(startedAt, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 40000);
+  while (Date.now() < deadline) {
+    await sleepMs(600);
+    let items = [];
+    try {
+      items = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 10 });
+    } catch (err) {
+      items = [];
+    }
+    const hit = items.find(
+      (it) => it && new Date(it.startTime).getTime() >= startedAt - 2000
+    );
+    if (!hit) continue;
+    if (hit.state === "complete") return { ok: true, filename: hit.filename || "" };
+    if (hit.state === "interrupted") return { ok: false, filename: hit.filename || "" };
+  }
+  return { ok: false, filename: "" };
+}
+
+/**
+ * 在扩展后台把 PDF 取成字节，用 Blob URL 交给下载器。
+ *
+ * 优势：扩展有 host 权限，fetch 不受跨域限制；Blob 下载不走服务器，
+ * 因此不会再被 CDN 的人机校验拦掉。
+ */
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+async function savePdfFromServiceWorker(url, folder, name) {
+  const startedAt = Date.now();
+  let response;
+  try {
+    response = await fetch(url, { credentials: "include" });
+  } catch (err) {
+    return { ok: false, detail: { error: String((err && err.message) || err).slice(0, 140) } };
+  }
+
+  let buffer;
+  try {
+    buffer = await response.arrayBuffer();
+  } catch (err) {
+    return {
+      ok: false,
+      detail: { status: response.status, error: "读取响应失败（可能被跨域限制）" },
+    };
+  }
+
+  const bytes = new Uint8Array(buffer);
+  const isPdf =
+    bytes.length > 4 &&
+    bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+  if (!isPdf) {
+    let head = "";
+    try {
+      head = new TextDecoder().decode(bytes.slice(0, 220)).replace(/\s+/g, " ");
+    } catch (err) {
+      head = "";
+    }
+    return {
+      ok: false,
+      detail: {
+        status: response.status,
+        type: (response.headers.get("content-type") || "").slice(0, 40),
+        size: bytes.length,
+        head,
+      },
+    };
+  }
+
+  // Service Worker 没有 URL.createObjectURL，交给 offscreen 文档做 Blob 下载
+  let made = null;
+  try {
+    await ensureOffscreen();
+    made = await chrome.runtime.sendMessage({
+      type: "blobDownload",
+      base64: bytesToBase64(bytes),
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      detail: { error: "offscreen 生成 Blob 失败: " + String((err && err.message) || err).slice(0, 120) },
+    };
+  }
+
+  if (!made || !made.ok || !made.objectUrl) {
+    return { ok: false, detail: { error: (made && made.error) || "未生成 Blob 地址" } };
+  }
+
+  try {
+    await startDownload({
+      url: made.objectUrl,
+      filename: folder + "/" + name,
+      saveAs: false,
+      conflictAction: "uniquify",
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      detail: { error: "Blob 下载失败: " + String((err && err.message) || err).slice(0, 120) },
+    };
+  }
+
+  const result = await waitForNewDownload(startedAt, 60000);
+  return {
+    ok: result.ok,
+    detail: { status: response.status, size: bytes.length, file: result.filename.slice(-40) },
+  };
+}
+
+async function savePdfViaBlob(tabId, url, folder, name) {
+  nameHint = { folder, name };
+  let result = null;
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: fetchPdfAsBlob,
+      args: [url, name],
+    });
+    result = (res && res.result) || null;
+  } catch (err) {
+    result = { ok: false, error: String((err && err.message) || err).slice(0, 120) };
+  }
+
+  if (!result || !result.ok) {
+    nameHint = null;
+    return { ok: false, detail: result || {} };
+  }
+
+  const startedAt = Date.now();
+  const got = await waitForNewDownload(startedAt - 30000, 30000);
+  nameHint = null;
+  return { ok: !!got.ok, detail: result, download: got };
+}
+
 async function capturePdfViaNavigation(url, timeoutMs, active) {
   const start = Date.now();
   let tabId = -1;
@@ -658,6 +804,63 @@ async function capturePdfViaNavigation(url, timeoutMs, active) {
     }
   }
   return found;
+}
+
+/**
+ * 在页面里把 PDF 取成字节，再用 Blob 触发一次本地下保存。
+ *
+ * 为什么：预签名地址对"浏览器导航"放行，对扩展的 downloads 请求会返回 HTML
+ * （没有 Referer、Sec-Fetch-Dest 也不同）。而在页面上下文里 fetch 拿到字节后，
+ * Blob 下载完全不走服务器，任何校验都拦不到。
+ *
+ * 注入执行，必须自包含。
+ */
+async function fetchPdfAsBlob(url, fileName) {
+  try {
+    const response = await fetch(url, { credentials: "include" });
+    const buffer = await response.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const isPdf =
+      bytes.length > 4 &&
+      bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+
+    if (!isPdf) {
+      let head = "";
+      try {
+        head = new TextDecoder().decode(bytes.slice(0, 240)).replace(/\s+/g, " ");
+      } catch (err) {
+        head = "";
+      }
+      return {
+        ok: false,
+        status: response.status,
+        type: (response.headers.get("content-type") || "").slice(0, 40),
+        size: bytes.length,
+        head,
+      };
+    }
+
+    const blob = new Blob([buffer], { type: "application/pdf" });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = fileName || "main.pdf";
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => {
+      try {
+        URL.revokeObjectURL(objectUrl);
+      } catch (err) {
+        /* ignore */
+      }
+    }, 120000);
+
+    return { ok: true, status: response.status, size: bytes.length };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err).slice(0, 160) };
+  }
 }
 
 async function activeTabUrl() {
@@ -761,13 +964,57 @@ async function runDownloads(job) {
         /* ignore */
       }
       if (viewerPdf) {
+        // 先试页面内取字节 + Blob 保存（绕开下载请求被拦的问题）
+        const tabId = activeTab && activeTab.id >= 0 ? activeTab.id : -1;
+
+        // 方案一：后台 fetch + Blob（不受跨域限制，也不走服务器）
+        await emit({
+          index,
+          total,
+          name: task.label,
+          state: "start",
+          note: "在后台取 PDF 字节，用 Blob 保存…",
+        });
+        const bySw = await savePdfFromServiceWorker(viewerPdf, root, task.name);
+        note("后台 Blob: " + JSON.stringify(bySw.detail).slice(0, 160));
+        if (bySw.ok) {
+          done += 1;
+          await emit({ index, total, name: task.label, state: "ok" });
+          continue;
+        }
+
+        // 方案二：页面内 fetch + Blob
+        if (tabId >= 0) {
+          await emit({
+            index,
+            total,
+            name: task.label,
+            state: "start",
+            note: "改用页面内取字节…",
+          });
+          const byBlob = await savePdfViaBlob(tabId, viewerPdf, root, task.name);
+          if (byBlob.ok) {
+            done += 1;
+            await emit({ index, total, name: task.label, state: "ok" });
+            continue;
+          }
+          note(
+            "Blob 方式失败: " +
+              JSON.stringify(byBlob.detail).slice(0, 160)
+          );
+          try {
+            await chrome.storage.local.set({ elsTrace: trace.concat(["Blob 方式失败: " + JSON.stringify(byBlob.detail).slice(0, 200)]) });
+          } catch (err) {
+            /* ignore */
+          }
+        }
         target = viewerPdf;
         await emit({
           index,
           total,
           name: task.label,
           state: "start",
-          note: "使用标签页里的 PDF 地址（预签名，无需授权）",
+          note: "改用直接下载（Blob 方式未成功）",
         });
       } else {
         let where = "";
