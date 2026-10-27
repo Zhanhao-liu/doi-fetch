@@ -519,6 +519,24 @@ function waitForDownload(id, timeoutMs) {
  *   chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/index.html?file=<编码后的地址>
  * 之前用 startsWith("chrome-extension://") 一刀切跳过，等于把最可靠的线索丢了。
  */
+/**
+ * 判断一个地址是不是"真正的 PDF 文件"。
+ *
+ * 关键：只看 **路径**，不看查询串。Elsevier 的中间页是
+ *   /science/article/pii/XXX/pdfft?md5=...&pid=1-s2.0-XXX-main.pdf
+ * 整串以 -main.pdf 结尾，用整串正则会被误判成 PDF，而它实际返回校验页 HTML。
+ */
+function looksLikeRealPdf(url) {
+  const raw = String(url || "");
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    return /\.pdf$/i.test(parsed.pathname);
+  } catch (err) {
+    return /\.pdf(?:[?#]|$)/i.test(raw);
+  }
+}
+
 function pdfUrlFromTabUrl(url) {
   const raw = String(url || "");
   if (!raw) return "";
@@ -544,7 +562,7 @@ function pdfUrlFromTabUrl(url) {
     try {
       const decoded = decodeURIComponent(raw);
       const inner = decoded.match(/https?:\/\/[^\s"'<>]+?\.pdf(\?[^\s"'<>]*)?/i);
-      if (inner) return inner[0];
+      if (inner && looksLikeRealPdf(inner[0])) return inner[0];
     } catch (err) {
       /* ignore */
     }
@@ -552,13 +570,13 @@ function pdfUrlFromTabUrl(url) {
   }
 
   // 情况二：标签页地址本身就是 PDF（含 pdf.sciencedirectassets.com 的签名地址）
-  if (/\.pdf(\?|$)/i.test(raw)) return raw;
+  if (looksLikeRealPdf(raw)) return raw;
 
   // 情况三：地址里嵌着 PDF 地址（少见但存在）
   try {
     const decoded = decodeURIComponent(raw);
     const inner = decoded.match(/https?:\/\/[^\s"'<>]+?\.pdf(\?[^\s"'<>]*)?/i);
-    if (inner) return inner[0];
+    if (inner && looksLikeRealPdf(inner[0])) return inner[0];
   } catch (err) {
     /* ignore */
   }
@@ -581,7 +599,7 @@ try {
       // 只认真正以 .pdf 结尾的地址。
       // 注意：不能按 sciencedirectassets.com 域名判断——那个域名同时托管网站的
       // JS/CSS/字体（例如 ai-components.js），曾因此把正文下载成 .js 文件。
-      if (/\.pdf(\?|$)/i.test(url)) {
+      if (looksLikeRealPdf(url)) {
         const at = Date.now();
         recentPdfByTab.set(details.tabId, { url, at });
         recentPdfLast = { url, at };
@@ -761,6 +779,18 @@ async function runDownloads(job) {
 
     // 兜底：target 必须是合法 http(s)，否则回退到原始任务地址
     if (!/^https?:/i.test(target || "")) target = task.url;
+
+    // 中间页（/pdfft、/pdf）不可能是正文本身，下下来只会是校验页
+    if (index === 0 && /\/(pdfft|pdf)(\?|$)/i.test(new URL(target, "https://x.invalid").pathname)) {
+      await emit({
+        index,
+        total,
+        name: task.label,
+        state: "fail",
+        error: "只拿到中间页地址（" + String(target).slice(0, 60) + "），没截到真正的 PDF",
+      });
+      continue;
+    }
 
     // 明显的静态资源一定不是正文，别下
     if (/\.(js|mjs|css|woff2?|ttf|eot|svg|png|jpe?g|gif|webp|ico|map)(\?|$)/i.test(target || "")) {

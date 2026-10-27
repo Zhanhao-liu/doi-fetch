@@ -1,0 +1,23 @@
+﻿fix(ext): 按 URL 路径判定 PDF，不再把 Elsevier 中间页当成 PDF（0.9.6）
+
+用户报「拿到的是 Elsevier 的校验页而不是 PDF」。原因是判定规则写错了对象：
+
+Elsevier 的中间页地址是
+  /science/article/pii/XXX/pdfft?md5=...&pid=1-s2.0-XXX-main.pdf
+整串以 -main.pdf 结尾，用 /\.pdf(\?|$)/ 去测整串会被误判成 PDF，于是
+webRequest 记录下来的是这张中间页，下载它当然只得到校验页 HTML。
+
+改动：
+- 新增 looksLikeRealPdf()：解析 URL 后只看 pathname 是否以 .pdf 结尾
+- webRequest 记录、标签页地址判定、内嵌地址提取全部改用它（两处内嵌提取都补上了校验）
+- 下载前若地址仍是 /pdfft 或 /pdf 端点，直接报「只拿到中间页地址…没截到真正的 PDF」
+
+单元校验（六种真实形态）：
+- 中间页 pdfft?...-main.pdf  → False / 取址为空
+- 签名 CDN main.pdf?X-Amz-*  → True  / 正确返回
+- ars.els-cdn.com/...mmc1.pdf → True  / 正确返回
+- 文章页 ?ref=pdf_download    → False / 取址为空
+- 旧式 /pdf?...-main.pdf      → False / 取址为空
+- ai-components.js            → False / 取址为空
+
+回归：Nature 正文 3170KB + 补充材料 1370KB，均为 %PDF-。
