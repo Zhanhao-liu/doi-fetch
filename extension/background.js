@@ -577,7 +577,10 @@ try {
     (details) => {
       if (details.tabId < 0) return;
       const url = details.url || "";
-      if (/\.pdf(\?|$)/i.test(url) || /sciencedirectassets\.com/i.test(url)) {
+      // 只认真正以 .pdf 结尾的地址。
+      // 注意：不能按 sciencedirectassets.com 域名判断——那个域名同时托管网站的
+      // JS/CSS/字体（例如 ai-components.js），曾因此把正文下载成 .js 文件。
+      if (/\.pdf(\?|$)/i.test(url)) {
         recentPdfByTab.set(details.tabId, { url, at: Date.now() });
       }
     },
@@ -689,6 +692,18 @@ async function runDownloads(job) {
 
     // 兜底：target 必须是合法 http(s)，否则回退到原始任务地址
     if (!/^https?:/i.test(target || "")) target = task.url;
+
+    // 明显的静态资源一定不是正文，别下
+    if (/\.(js|mjs|css|woff2?|ttf|eot|svg|png|jpe?g|gif|webp|ico|map)(\?|$)/i.test(target || "")) {
+      await emit({
+        index,
+        total,
+        name: task.label,
+        state: "fail",
+        error: "地址指向的是网站资源而不是文献文件，已跳过",
+      });
+      continue;
+    }
     if (!/^https?:/i.test(target || "")) {
       await emit({
         index,
