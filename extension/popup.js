@@ -436,6 +436,9 @@ function extractPageInfo() {
   };
   addPdf(meta("citation_pdf_url"));
   addPdf(meta("bepress_citation_pdf_url"));
+  // Zotero 的第一优先级就是 #pdfLink；ScienceDirect 的 PDF 按钮常常就是它
+  const pdfLinkNode = document.querySelector("#pdfLink");
+  if (pdfLinkNode) addPdf(pdfLinkNode.href);
 
   const sis = [];
   const pageKey = location.href.split("#")[0];

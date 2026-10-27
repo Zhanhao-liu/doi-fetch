@@ -543,6 +543,64 @@ function pdfUrlFromTabUrl(url) {
   return /\.pdf(\?|$)/i.test(raw) ? raw : "";
 }
 
+/**
+ * 解析 ScienceDirect 的「中间页」拿到真正的 PDF 地址。
+ *
+ * 照搬 Zotero Connector 的 ScienceDirect 翻译器（parseIntermediatePDFPage）：
+ * `/pdfft?md5=...&pid=...` 返回的不是 PDF，而是一张带
+ *   <meta http-equiv="Refresh" content="0;URL=<真正的PDF>">
+ * 的小页面；真正的地址通常是 pdf.sciencedirectassets.com 的预签名链接。
+ * 另外页面若给出 `#redirect-message a`，也用它。
+ *
+ * 注入页面执行，必须自包含。
+ */
+async function elsevierResolveIntermediate(url) {
+  try {
+    const response = await fetch(url, { credentials: "include", redirect: "follow" });
+    const type = (response.headers.get("content-type") || "").toLowerCase();
+    if (type.includes("pdf")) {
+      return response.url || url; // 已经是 PDF，直接用
+    }
+    const text = await response.text();
+
+    // 1) 正则先抓 meta refresh（不依赖 DOM 解析成功）
+    const metaMatch =
+      text.match(/http-equiv=["']?refresh["']?[^>]*?content=["']?\s*\d+\s*;\s*url=([^"'>\s]+)/i) ||
+      text.match(/content=["']?\s*\d+\s*;\s*url=([^"'>\s]+)/i);
+    if (metaMatch) {
+      return metaMatch[1].replace(/&amp;/g, "&");
+    }
+
+    // 2) DOM 兜底
+    const doc = new DOMParser().parseFromString(text, "text/html");
+    const anchor = doc.querySelector("#redirect-message a");
+    if (anchor && anchor.getAttribute("href")) {
+      return new URL(anchor.getAttribute("href"), location.href).href;
+    }
+    const refresh = doc.querySelector('meta[http-equiv="Refresh"], meta[http-equiv="refresh"]');
+    if (refresh && refresh.getAttribute("content")) {
+      const inner = refresh.getAttribute("content").match(/url=(.+)$/i);
+      if (inner) return inner[1].trim();
+    }
+    return "";
+  } catch (err) {
+    return "";
+  }
+}
+
+async function resolveElsevierPdf(tabId, url) {
+  try {
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: elsevierResolveIntermediate,
+      args: [url],
+    });
+    return (result && result.result) || "";
+  } catch (err) {
+    return "";
+  }
+}
+
 async function activeTabUrl() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -582,6 +640,18 @@ async function runDownloads(job) {
     if (index === 0) {
       const viewerPdf = pdfUrlFromTabUrl(await activeTabUrl());
       if (viewerPdf) target = viewerPdf;
+    }
+
+    // Elsevier：正文地址是「中间页」，要先解析出真正的 PDF 地址。
+    // 只影响 sciencedirect/elsevier 的正文任务，其它出版社路径不变。
+    const looksElsevier = /sciencedirect\.com|elsevier\.com/i.test(task.url || "");
+    if (index === 0 && looksElsevier && !/pdf\.sciencedirectassets\.com/i.test(target)) {
+      const tabs = await chrome.tabs.query({});
+      const page = tabs.find((tab) => /sciencedirect\.com|elsevier\.com/i.test(tab.url || ""));
+      if (page && page.id) {
+        const resolved = await resolveElsevierPdf(page.id, target);
+        if (resolved && resolved !== target) target = resolved;
+      }
     }
 
     try {
