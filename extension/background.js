@@ -603,6 +603,34 @@ async function elsevierResolveIntermediate(url) {
   }
 }
 
+/**
+ * 导航到 Elsevier 的中间页，等它跑完 JS 挑战，再从标签页地址里取出真正的 PDF。
+ *
+ * 诊断实测：/pdfft 会跳到 ?ref=cra_js_challenge&fr=njs —— 这是 JS 挑战页，
+ * fetch 拿到的永远是挑战页本身（[html]），只有真实导航才会执行 JS 并通过；
+ * 通过后标签页地址会变成 pdf.sciencedirectassets.com 上的预签名链接。
+ */
+async function navigateAndCapturePdf(tabId, url, timeoutMs) {
+  try {
+    await chrome.tabs.update(tabId, { url });
+  } catch (err) {
+    return "";
+  }
+  const deadline = Date.now() + (timeoutMs || 25000);
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    let tabUrl = "";
+    try {
+      tabUrl = (await chrome.tabs.get(tabId)).url || "";
+    } catch (err) {
+      tabUrl = "";
+    }
+    const pdf = pdfUrlFromTabUrl(tabUrl);
+    if (pdf) return pdf;
+  }
+  return "";
+}
+
 async function resolveElsevierPdf(tabId, url) {
   try {
     const [result] = await chrome.scripting.executeScript({
@@ -664,8 +692,22 @@ async function runDownloads(job) {
       const tabs = await chrome.tabs.query({});
       const page = tabs.find((tab) => /sciencedirect\.com|elsevier\.com/i.test(tab.url || ""));
       if (page && page.id) {
+        // 先试轻量的中间页解析（有些情况直接给 PDF 地址）
         const resolved = await resolveElsevierPdf(page.id, target);
-        if (resolved && resolved !== target) target = resolved;
+        if (resolved && /\.pdf(\?|$)/i.test(resolved)) {
+          target = resolved;
+        } else {
+          // 解析到的是 JS 挑战页 → 必须真实导航，让挑战跑完
+          await emit({
+            index,
+            total,
+            name: task.label,
+            state: "start",
+            note: "遇到 JS 挑战，正在导航以通过…",
+          });
+          const captured = await navigateAndCapturePdf(page.id, target, 30000);
+          if (captured) target = captured;
+        }
       }
     }
 

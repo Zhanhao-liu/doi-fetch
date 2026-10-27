@@ -1,0 +1,13 @@
+﻿fix(ext): Elsevier 改用真实导航通过 JS 挑战（0.8.5）
+
+诊断显示中间页的跳转目标是 ?ref=cra_js_challenge&fr=njs —— Elsevier 的 JS
+挑战页，fetch 拿到的永远是挑战页本身（[html]），只有真实导航才会执行 JS 并
+通过；通过后标签页地址会变成 pdf.sciencedirectassets.com 上的预签名链接。
+
+- 新增 navigateAndCapturePdf：把标签页导航到中间页地址，轮询 tab.url，
+  一旦变成 .pdf 就返回该地址
+- 单篇正文的 Elsevier 分支：先做轻量中间页解析；若解析到的是挑战页而不是
+  PDF，就改为导航通过挑战，再下载捕获到的预签名地址
+- 只影响 sciencedirect/elsevier 的正文任务
+
+回归：Nature / PLOS 正常（正文 PDF + 附件，popup 无报错）。
