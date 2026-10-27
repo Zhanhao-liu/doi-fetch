@@ -522,6 +522,8 @@ function waitForDownload(id, timeoutMs) {
 function pdfUrlFromTabUrl(url) {
   const raw = String(url || "");
   if (!raw) return "";
+
+  // 情况一：Chrome 内置阅读器，地址是 chrome-extension://...?file=<编码后的 PDF 地址>
   if (/^chrome-extension:\/\//i.test(raw)) {
     try {
       const parsed = new URL(raw);
@@ -535,203 +537,67 @@ function pdfUrlFromTabUrl(url) {
       try {
         return decodeURIComponent(hashMatch[1]);
       } catch (err) {
-        return "";
-      }
-    }
-    return "";
-  }
-  return /\.pdf(\?|$)/i.test(raw) ? raw : "";
-}
-
-/**
- * 解析 ScienceDirect 的「中间页」拿到真正的 PDF 地址。
- *
- * 照搬 Zotero Connector 的 ScienceDirect 翻译器（parseIntermediatePDFPage）：
- * `/pdfft?md5=...&pid=...` 返回的不是 PDF，而是一张带
- *   <meta http-equiv="Refresh" content="0;URL=<真正的PDF>">
- * 的小页面；真正的地址通常是 pdf.sciencedirectassets.com 的预签名链接。
- * 另外页面若给出 `#redirect-message a`，也用它。
- *
- * 注入页面执行，必须自包含。
- */
-async function elsevierResolveIntermediate(url) {
-  try {
-    const response = await fetch(url, { credentials: "include", redirect: "follow" });
-    const type = (response.headers.get("content-type") || "").toLowerCase();
-    if (type.includes("pdf")) {
-      return response.url || url; // 已经是 PDF，直接用
-    }
-    const text = await response.text();
-
-    // 1) 正则先抓 meta refresh（不依赖 DOM 解析成功）
-    const metaMatch =
-      text.match(/http-equiv=["']?refresh["']?[^>]*?content=["']?\s*\d+\s*;\s*url=([^"'>\s]+)/i) ||
-      text.match(/content=["']?\s*\d+\s*;\s*url=([^"'>\s]+)/i);
-    if (metaMatch) {
-      const raw = metaMatch[1].replace(/&amp;/g, "&");
-      try {
-        return new URL(raw, location.href).href; // 相对地址也能变成合法绝对地址
-      } catch (err) {
-        return "";
-      }
-    }
-
-    // 2) DOM 兜底
-    const doc = new DOMParser().parseFromString(text, "text/html");
-    const anchor = doc.querySelector("#redirect-message a");
-    if (anchor && anchor.getAttribute("href")) {
-      try {
-        return new URL(anchor.getAttribute("href"), location.href).href;
-      } catch (err) {
-        return "";
-      }
-    }
-    const refresh = doc.querySelector('meta[http-equiv="Refresh"], meta[http-equiv="refresh"]');
-    if (refresh && refresh.getAttribute("content")) {
-      const inner = refresh.getAttribute("content").match(/url=(.+)$/i);
-      if (inner) {
-        try {
-          return new URL(inner[1].trim(), location.href).href;
-        } catch (err) {
-          return "";
-        }
-      }
-    }
-    return "";
-  } catch (err) {
-    return "";
-  }
-}
-
-/**
- * 导航到 Elsevier 的中间页，等它跑完 JS 挑战，再从标签页地址里取出真正的 PDF。
- *
- * 诊断实测：/pdfft 会跳到 ?ref=cra_js_challenge&fr=njs —— 这是 JS 挑战页，
- * fetch 拿到的永远是挑战页本身（[html]），只有真实导航才会执行 JS 并通过；
- * 通过后标签页地址会变成 pdf.sciencedirectassets.com 上的预签名链接。
- */
-/**
- * Elsevier 取证：把整条链路的原始结果依次记录下来，只读、不改任何下载行为。
- *
- * 需要在真实浏览器里跑，因为它会创建一个临时标签页做真实导航 —— 只有导航
- * 才能通过 cra_js_challenge，而我们要看的就是导航之后地址变成了什么。
- */
-async function deepDiagnoseElsevier(pageTabId, url) {
-  const lines = [];
-  lines.push("目标地址: " + url.slice(0, 150));
-
-  // 1) 页面上下文 fetch，看原始返回
-  try {
-    const [probe] = await chrome.scripting.executeScript({
-      target: { tabId: pageTabId, allFrames: true },
-      func: elsevierInspectRaw,
-      args: [url],
-    });
-    const info = (probe && probe.result) || {};
-    lines.push("① fetch: status=" + (info.status || "?") +
-               " type=" + (info.type || "?") + " 长度=" + (info.length || 0));
-    lines.push("   开头: " + (info.head || "").slice(0, 180));
-    if (info.refresh) lines.push("   meta refresh → " + info.refresh.slice(0, 150));
-  } catch (err) {
-    lines.push("① fetch 失败: " + String(err && err.message).slice(0, 100));
-  }
-
-  // 2) 新建临时标签页做真实导航，记录地址变化
-  let helper = null;
-  try {
-    helper = await chrome.tabs.create({ url, active: false });
-    const seen = [];
-    const deadline = Date.now() + 25000;
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-      let current = "";
-      try {
-        current = (await chrome.tabs.get(helper.id)).url || "";
-      } catch (err) {
-        break;
-      }
-      if (current && seen[seen.length - 1] !== current) {
-        seen.push(current);
-        if (seen.length >= 5) break;
-      }
-      if (/\.pdf(\?|$)/i.test(pdfUrlFromTabUrl(current))) break;
-    }
-    lines.push("② 导航后地址变化（共 " + seen.length + " 次）:");
-    seen.forEach((u, i) => lines.push("   " + (i + 1) + ". " + u.slice(0, 150)));
-    const finalPdf = seen.length ? pdfUrlFromTabUrl(seen[seen.length - 1]) : "";
-    lines.push("③ 能否取出 PDF 地址: " + (finalPdf ? finalPdf.slice(0, 150) : "否"));
-  } catch (err) {
-    lines.push("② 导航失败: " + String(err && err.message).slice(0, 100));
-  } finally {
-    if (helper && helper.id) {
-      try {
-        await chrome.tabs.remove(helper.id);
-      } catch (err) {
         /* ignore */
       }
     }
-  }
-
-  return lines.join("\n");
-}
-
-/* 注入页面：只读取中间页的原始响应，不做任何跳转 */
-function elsevierInspectRaw(url) {
-  return fetch(url, { credentials: "include", redirect: "follow" })
-    .then(async (response) => {
-      const text = await response.text();
-      const refresh =
-        text.match(/http-equiv=["']?refresh["']?[^>]*?content=["']?\s*\d+\s*;\s*url=([^"'>\s]+)/i) ||
-        text.match(/content=["']?\s*\d+\s*;\s*url=([^"'>\s]+)/i);
-      return {
-        status: response.status,
-        type: (response.headers.get("content-type") || "").slice(0, 60),
-        length: text.length,
-        head: text.replace(/\s+/g, " ").slice(0, 200),
-        refresh: refresh ? refresh[1] : "",
-      };
-    })
-    .catch((err) => ({ error: String(err && err.message) }));
-}
-
-async function navigateAndCapturePdf(tabId, url, timeoutMs) {
-  try {
-    await chrome.tabs.update(tabId, { url });
-  } catch (err) {
+    // 兜底：无论地址长什么样，只要整串里嵌着一个 http(s) 的 .pdf 地址就解出来
+    try {
+      const decoded = decodeURIComponent(raw);
+      const inner = decoded.match(/https?:\/\/[^\s"'<>]+?\.pdf(\?[^\s"'<>]*)?/i);
+      if (inner) return inner[0];
+    } catch (err) {
+      /* ignore */
+    }
     return "";
   }
-  const deadline = Date.now() + (timeoutMs || 25000);
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-    let tabUrl = "";
-    try {
-      tabUrl = (await chrome.tabs.get(tabId)).url || "";
-    } catch (err) {
-      tabUrl = "";
-    }
-    const pdf = pdfUrlFromTabUrl(tabUrl);
-    if (pdf) return pdf;
+
+  // 情况二：标签页地址本身就是 PDF（含 pdf.sciencedirectassets.com 的签名地址）
+  if (/\.pdf(\?|$)/i.test(raw)) return raw;
+
+  // 情况三：地址里嵌着 PDF 地址（少见但存在）
+  try {
+    const decoded = decodeURIComponent(raw);
+    const inner = decoded.match(/https?:\/\/[^\s"'<>]+?\.pdf(\?[^\s"'<>]*)?/i);
+    if (inner) return inner[0];
+  } catch (err) {
+    /* ignore */
   }
   return "";
 }
 
-async function resolveElsevierPdf(tabId, url) {
-  try {
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      func: elsevierResolveIntermediate,
-      args: [url],
-    });
-    return (result && result.result) || "";
-  } catch (err) {
-    return "";
-  }
+/* 记录每个标签页最近出现过的 PDF 地址。
+ *
+ * 为什么需要：Chrome 内置 PDF 阅读器的标签页属于另一个扩展的内部页，
+ * 即使有 tabs 权限也可能读不到 tab.url。而网络层一定能看到真实请求，
+ * 所以这里兜一层——标签页地址取不到时，用最近一次请求的 PDF 地址。 */
+const recentPdfByTab = new Map();
+
+try {
+  chrome.webRequest.onBeforeRequest.addListener(
+    (details) => {
+      if (details.tabId < 0) return;
+      const url = details.url || "";
+      if (/\.pdf(\?|$)/i.test(url) || /sciencedirectassets\.com/i.test(url)) {
+        recentPdfByTab.set(details.tabId, { url, at: Date.now() });
+      }
+    },
+    { urls: ["<all_urls>"] }
+  );
+} catch (err) {
+  /* webRequest 不可用时静默跳过 */
+}
+
+function recentPdfForTab(tabId) {
+  const hit = recentPdfByTab.get(tabId);
+  if (!hit) return "";
+  if (Date.now() - hit.at > 10 * 60 * 1000) return "";
+  return hit.url || "";
 }
 
 async function activeTabUrl() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    return (tab && tab.url) || "";
+    return (tab && (tab.url || tab.pendingUrl)) || "";
   } catch (err) {
     return "";
   }
@@ -780,7 +646,17 @@ async function runDownloads(job) {
     // 所以：标签页已经是 PDF 就用它；不是就先让用户点开 PDF，别去撞校验。
     const looksElsevier = /sciencedirect\.com|elsevier\.com/i.test(task.url || "");
     if (index === 0 && looksElsevier) {
-      const viewerPdf = pdfUrlFromTabUrl(await activeTabUrl());
+      let activeTab = null;
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        activeTab = tab || null;
+      } catch (err) {
+        activeTab = null;
+      }
+      let viewerPdf = pdfUrlFromTabUrl((activeTab && (activeTab.url || activeTab.pendingUrl)) || "");
+      if (!viewerPdf && activeTab && activeTab.id >= 0) {
+        viewerPdf = recentPdfForTab(activeTab.id); // 地址读不到时用网络记录
+      }
       if (viewerPdf) {
         target = viewerPdf;
         await emit({
@@ -791,12 +667,21 @@ async function runDownloads(job) {
           note: "使用标签页里的 PDF 地址（预签名，无需授权）",
         });
       } else {
+        let where = "";
+        try {
+          where = await activeTabUrl();
+        } catch (err) {
+          where = "";
+        }
         await emit({
           index,
           total,
           name: task.label,
           state: "fail",
-          error: "请先在页面上点『View PDF』把 PDF 打开，再点开始下载",
+          error:
+            "没取到 PDF 地址；当前标签页 = " +
+            (where ? where.slice(0, 110) : "(空)") +
+            "。请把这段发我",
         });
         continue;
       }

@@ -1,0 +1,19 @@
+﻿fix(ext): 补 tabs/webRequest 权限，PDF 阅读器标签页地址现在读得到（0.9.3）
+
+用户截图显示 PDF 已经打开在标签页里（地址栏是
+pdf.sciencedirectassets.com/...main.pdf?X-Amz-Security-Token=...），但扩展报
+"没取到 PDF 地址"。查 manifest 发现 permissions 里没有 tabs：
+
+Chrome 内置 PDF 阅读器的标签页属于另一个扩展的内部页
+（chrome-extension://mhjfb...），host 权限对这类地址无效，所以 tab.url 是
+undefined —— 于是取址函数拿到的永远是空串。
+
+改动：
+- permissions 增加 tabs（让 tab.url / pendingUrl 可用）与 webRequest
+- 新增 recentPdfByTab / recentPdfForTab：用 webRequest.onBeforeRequest 记录
+  每个标签页最近出现的 PDF 地址，标签页地址读不到时用它兜底（10 分钟有效）
+- pdfUrlFromTabUrl 增加兜底：地址串里只要嵌着 http(s) 的 .pdf 地址就解出来
+- 取不到地址时的报错改为打印真实标签页地址，便于定位
+
+验证（全新档案，避免旧 Service Worker 缓存）：tab.url 可见、解析正确、
+网络记录同样捕获到 PDF 地址、下载落盘 3170KB %PDF-。
