@@ -769,29 +769,32 @@ async function runDownloads(job) {
       if (viewerPdf) target = viewerPdf;
     }
 
-    // Elsevier：正文地址是「中间页」，要先解析出真正的 PDF 地址。
-    // 只影响 sciencedirect/elsevier 的正文任务，其它出版社路径不变。
+    // Elsevier：完全照搬 Zotero 的做法。
+    //
+    // Zotero 的 ScienceDirect 翻译器并不在浏览器里下载 PDF，它只是：
+    //   1) 取 #pdfLink（或 citation_pdf_url）
+    //   2) parseIntermediatePDFPage() 抓这张中间页的 meta refresh 目标
+    //   3) 把该目标地址作为附件 URL 交给下载方
+    // 也就是说它下载的是**跳转目标**（哪怕地址里没有 .pdf），而不是原始
+    // /pdfft。我们之前因为"解析结果不像 PDF"就丢弃它、回头下载 /pdfft，
+    // 拿到的自然是挑战页 HTML。
     const looksElsevier = /sciencedirect\.com|elsevier\.com/i.test(task.url || "");
-    if (index === 0 && looksElsevier && !/pdf\.sciencedirectassets\.com/i.test(target)) {
+    if (index === 0 && looksElsevier) {
+      let resolved = "";
       const tabs = await chrome.tabs.query({});
       const page = tabs.find((tab) => /sciencedirect\.com|elsevier\.com/i.test(tab.url || ""));
       if (page && page.id) {
-        // 先试轻量的中间页解析（有些情况直接给 PDF 地址）
-        const resolved = await resolveElsevierPdf(page.id, target);
-        if (resolved && /\.pdf(\?|$)/i.test(resolved)) {
-          target = resolved;
-        } else {
-          // 解析到的是 JS 挑战页 → 必须真实导航，让挑战跑完
-          await emit({
-            index,
-            total,
-            name: task.label,
-            state: "start",
-            note: "遇到 JS 挑战，正在导航以通过…",
-          });
-          const captured = await navigateAndCapturePdf(page.id, target, 30000);
-          if (captured) target = captured;
-        }
+        resolved = await resolveElsevierPdf(page.id, target);
+      }
+      if (resolved) {
+        target = resolved; // 照 Zotero：无论它长什么样都用它
+        await emit({
+          index,
+          total,
+          name: task.label,
+          state: "start",
+          note: "已解析出跳转地址，按 Zotero 的方式下载",
+        });
       }
     }
 
@@ -816,6 +819,38 @@ async function runDownloads(job) {
         conflictAction: "uniquify",
       });
       const state = await waitForDownload(id, 180000);
+
+      // Elsevier 正文若仍落成网页，说明 CRA 校验没过：删掉并说清楚
+      if (state === "complete" && index === 0 && looksElsevier) {
+        let savedName = "";
+        try {
+          const found = await chrome.downloads.search({ id });
+          savedName = String((found && found[0] && found[0].filename) || "");
+        } catch (err) {
+          savedName = "";
+        }
+        if (/\.html?$/i.test(savedName)) {
+          try {
+            await chrome.downloads.removeFile(id);
+          } catch (err) {
+            /* ignore */
+          }
+          try {
+            await chrome.downloads.erase({ id });
+          } catch (err) {
+            /* ignore */
+          }
+          await emit({
+            index,
+            total,
+            name: task.label,
+            state: "fail",
+            error: "拿到的是 Elsevier 的校验页而不是 PDF，已删除",
+          });
+          continue;
+        }
+      }
+
       if (state === "complete") {
         done += 1;
         await emit({ index, total, name: task.label, state: "ok" });
