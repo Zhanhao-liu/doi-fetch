@@ -1145,6 +1145,17 @@ try {
   /* ignore */
 }
 
+/** 判断某个 PDF 地址是否属于当前这篇（按 PII 或 DOI 片段比对）。 */
+function pdfBelongsToPaper(pdfUrl, taskUrl) {
+  const pdf = String(pdfUrl || "").toUpperCase();
+  if (!pdf) return false;
+  const piiMatch = String(taskUrl || "").match(/\/pii\/([A-Za-z0-9]+)/i);
+  if (piiMatch) return pdf.includes(piiMatch[1].toUpperCase());
+  const doiMatch = String(taskUrl || "").match(/10\.\d{4,9}\/[^\s?&#]+/);
+  if (doiMatch) return pdf.includes(doiMatch[0].toUpperCase());
+  return false; // 认不出归属就别用历史记录，宁可重新捕获
+}
+
 async function activeTabUrl() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -1210,11 +1221,21 @@ async function runDownloads(job) {
       note("标签页地址: " + String((activeTab && (activeTab.url || activeTab.pendingUrl)) || "(空)").slice(0, 120));
       let viewerPdf = pdfUrlFromTabUrl((activeTab && (activeTab.url || activeTab.pendingUrl)) || "");
       if (!viewerPdf && activeTab && activeTab.id >= 0) {
-        viewerPdf = recentPdfForTab(activeTab.id); // 地址读不到时用网络记录
-        note("本标签页网络记录: " + (viewerPdf || "(无)").slice(0, 120));
+        const perTab = recentPdfForTab(activeTab.id);
+        // 必须属于本篇，否则会把上一篇的地址拿来用
+        if (perTab && pdfBelongsToPaper(perTab, task.url)) {
+          viewerPdf = perTab;
+        }
+        note("本标签页网络记录: " + (perTab || "(无)").slice(0, 110) +
+             (perTab && !viewerPdf ? "（不属于本篇，已忽略）" : ""));
       }
       if (!viewerPdf && recentPdfLast.at > Date.now() - 5 * 60 * 1000) {
-        viewerPdf = recentPdfLast.url; // 最近 5 分钟内任何地方出现过的 PDF
+        if (pdfBelongsToPaper(recentPdfLast.url, task.url)) {
+          viewerPdf = recentPdfLast.url;
+          note("沿用最近的同篇记录");
+        } else {
+          note("最近记录属于别的论文，已忽略: " + recentPdfLast.url.slice(0, 90));
+        }
       }
       if (!viewerPdf) {
         await emit({
