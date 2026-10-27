@@ -1159,6 +1159,12 @@ async function runDownloads(job) {
         } catch (err) {
           savedName = "";
         }
+        note("直下结果: " + savedName.split(/[\\/]/).pop() + " (state=" + state + ")");
+        try {
+          await chrome.storage.local.set({ elsTrace: trace });
+        } catch (err) {
+          /* ignore */
+        }
         if (/\.html?$/i.test(savedName)) {
           try {
             await chrome.downloads.removeFile(id);
@@ -1187,6 +1193,14 @@ async function runDownloads(job) {
 
       if (state === "complete") {
         done += 1;
+        if (index === 0 && looksElsevier) {
+          note("直下成功");
+          try {
+            await chrome.storage.local.set({ elsTrace: trace });
+          } catch (err) {
+            /* ignore */
+          }
+        }
         await emit({ index, total, name: task.label, state: "ok" });
       } else {
         await emit({
