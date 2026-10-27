@@ -667,62 +667,76 @@ function bytesToBase64(bytes) {
 
 async function savePdfFromServiceWorker(url, folder, name) {
   const startedAt = Date.now();
-  let response;
-  try {
-    response = await fetch(url, { credentials: "include" });
-  } catch (err) {
-    return { ok: false, detail: { error: String((err && err.message) || err).slice(0, 140) } };
-  }
+  const attempts = [];
+  let buffer = null;
+  let okResponse = null;
 
-  let buffer;
-  try {
-    buffer = await response.arrayBuffer();
-  } catch (err) {
-    return {
-      ok: false,
-      detail: { status: response.status, error: "读取响应失败（可能被跨域限制）" },
-    };
-  }
+  // 预签名地址本身带授权，不需要 cookie；带 cookie 反而可能被 CDN 当成异常请求。
+  // 先不带，再带，两次都记录结果。
+  for (const credentials of ["omit", "include"]) {
+    let response = null;
+    try {
+      response = await fetch(url, { credentials });
+    } catch (err) {
+      attempts.push({ credentials, error: String((err && err.message) || err).slice(0, 90) });
+      continue;
+    }
 
-  const bytes = new Uint8Array(buffer);
-  const isPdf =
-    bytes.length > 4 &&
-    bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
-  if (!isPdf) {
+    let buf = null;
+    try {
+      buf = await response.arrayBuffer();
+    } catch (err) {
+      attempts.push({ credentials, status: response.status, error: "读取响应失败" });
+      continue;
+    }
+
+    const bytes = new Uint8Array(buf);
+    const isPdf =
+      bytes.length > 4 &&
+      bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
+
+    if (isPdf) {
+      buffer = buf;
+      okResponse = response;
+      attempts.push({ credentials, status: response.status, pdf: true, size: bytes.length });
+      break;
+    }
+
     let head = "";
     try {
-      head = new TextDecoder().decode(bytes.slice(0, 220)).replace(/\s+/g, " ");
+      head = new TextDecoder().decode(bytes.slice(0, 160)).replace(/\s+/g, " ");
     } catch (err) {
       head = "";
     }
-    return {
-      ok: false,
-      detail: {
-        status: response.status,
-        type: (response.headers.get("content-type") || "").slice(0, 40),
-        size: bytes.length,
-        head,
-      },
-    };
+    attempts.push({
+      credentials,
+      status: response.status,
+      type: (response.headers.get("content-type") || "").slice(0, 30),
+      size: bytes.length,
+      head,
+    });
   }
 
-  // Service Worker 没有 URL.createObjectURL，交给 offscreen 文档做 Blob 下载
+  if (!buffer) {
+    return { ok: false, detail: { attempts } };
+  }
+
   let made = null;
   try {
     await ensureOffscreen();
     made = await chrome.runtime.sendMessage({
       type: "blobDownload",
-      base64: bytesToBase64(bytes),
+      base64: bytesToBase64(new Uint8Array(buffer)),
     });
   } catch (err) {
     return {
       ok: false,
-      detail: { error: "offscreen 生成 Blob 失败: " + String((err && err.message) || err).slice(0, 120) },
+      detail: { attempts, error: "offscreen 生成 Blob 失败: " + String((err && err.message) || err).slice(0, 100) },
     };
   }
 
   if (!made || !made.ok || !made.objectUrl) {
-    return { ok: false, detail: { error: (made && made.error) || "未生成 Blob 地址" } };
+    return { ok: false, detail: { attempts, error: (made && made.error) || "未生成 Blob 地址" } };
   }
 
   try {
@@ -735,14 +749,19 @@ async function savePdfFromServiceWorker(url, folder, name) {
   } catch (err) {
     return {
       ok: false,
-      detail: { error: "Blob 下载失败: " + String((err && err.message) || err).slice(0, 120) },
+      detail: { attempts, error: "Blob 下载失败: " + String((err && err.message) || err).slice(0, 100) },
     };
   }
 
   const result = await waitForNewDownload(startedAt, 60000);
   return {
     ok: result.ok,
-    detail: { status: response.status, size: bytes.length, file: result.filename.slice(-40) },
+    detail: {
+      attempts,
+      status: okResponse ? okResponse.status : 0,
+      size: new Uint8Array(buffer).length,
+      file: result.filename.slice(-40),
+    },
   };
 }
 
@@ -863,6 +882,52 @@ async function fetchPdfAsBlob(url, fileName) {
   }
 }
 
+/* 给 Elsevier 的 CDN 请求补上 Referer / Origin。
+ *
+ * 浏览器点开 PDF 时是导航请求，带 Referer 和完整的 Sec-Fetch 头；扩展发起的
+ * fetch / downloads 请求没有这些，CDN 便会回一张校验页 HTML。Referer 可以用
+ * declarativeNetRequest 补上，这是扩展唯一能改的那一项。 */
+async function installElsevierHeaderRule() {
+  try {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [1001],
+      addRules: [
+        {
+          id: 1001,
+          priority: 1,
+          action: {
+            type: "modifyHeaders",
+            requestHeaders: [
+              { header: "Referer", operation: "set", value: "https://www.sciencedirect.com/" },
+              { header: "Origin", operation: "set", value: "https://www.sciencedirect.com" },
+              { header: "Accept", operation: "set", value: "application/pdf,*/*" },
+            ],
+          },
+          condition: {
+            urlFilter: "||pdf.sciencedirectassets.com",
+            resourceTypes: [
+              "main_frame",
+              "sub_frame",
+              "xmlhttprequest",
+              "other",
+              "media",
+              "object",
+            ],
+          },
+        },
+      ],
+    });
+  } catch (err) {
+    /* 规则装不上就继续，不影响其它路径 */
+  }
+}
+
+try {
+  installElsevierHeaderRule();
+} catch (err) {
+  /* ignore */
+}
+
 async function activeTabUrl() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -958,11 +1023,14 @@ async function runDownloads(job) {
         }
       }
       note("最终采用: " + String(viewerPdf || "(无)").slice(0, 120));
-      try {
-        await chrome.storage.local.set({ elsTrace: trace });
-      } catch (err) {
-        /* ignore */
-      }
+      const persist = async () => {
+        try {
+          await chrome.storage.local.set({ elsTrace: trace });
+        } catch (err) {
+          /* ignore */
+        }
+      };
+      await persist();
       if (viewerPdf) {
         // 先试页面内取字节 + Blob 保存（绕开下载请求被拦的问题）
         const tabId = activeTab && activeTab.id >= 0 ? activeTab.id : -1;
@@ -980,6 +1048,7 @@ async function runDownloads(job) {
         if (bySw.ok) {
           done += 1;
           await emit({ index, total, name: task.label, state: "ok" });
+          await persist();
           continue;
         }
 
@@ -996,12 +1065,10 @@ async function runDownloads(job) {
           if (byBlob.ok) {
             done += 1;
             await emit({ index, total, name: task.label, state: "ok" });
+            await persist();
             continue;
           }
-          note(
-            "Blob 方式失败: " +
-              JSON.stringify(byBlob.detail).slice(0, 160)
-          );
+          note("页面 Blob: " + JSON.stringify(byBlob.detail).slice(0, 160));
           try {
             await chrome.storage.local.set({ elsTrace: trace.concat(["Blob 方式失败: " + JSON.stringify(byBlob.detail).slice(0, 200)]) });
           } catch (err) {
@@ -1110,7 +1177,9 @@ async function runDownloads(job) {
             state: "fail",
             error:
               "拿到的是校验页而不是 PDF，已删除；用的地址 = " +
-              String(target).slice(0, 130),
+              String(target).slice(0, 130) +
+              "｜追踪：" +
+              trace.slice(-2).join(" / ").slice(0, 200),
           });
           continue;
         }
