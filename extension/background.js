@@ -712,6 +712,9 @@ async function runDownloads(job) {
     // 所以：标签页已经是 PDF 就用它；不是就先让用户点开 PDF，别去撞校验。
     const looksElsevier = /sciencedirect\.com|elsevier\.com/i.test(task.url || "");
     if (index === 0 && looksElsevier) {
+      const trace = [];
+      const note = (line) => trace.push(line);
+      note("任务地址: " + String(task.url).slice(0, 120));
       let activeTab = null;
       try {
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -719,9 +722,11 @@ async function runDownloads(job) {
       } catch (err) {
         activeTab = null;
       }
+      note("标签页地址: " + String((activeTab && (activeTab.url || activeTab.pendingUrl)) || "(空)").slice(0, 120));
       let viewerPdf = pdfUrlFromTabUrl((activeTab && (activeTab.url || activeTab.pendingUrl)) || "");
       if (!viewerPdf && activeTab && activeTab.id >= 0) {
         viewerPdf = recentPdfForTab(activeTab.id); // 地址读不到时用网络记录
+        note("本标签页网络记录: " + (viewerPdf || "(无)").slice(0, 120));
       }
       if (!viewerPdf && recentPdfLast.at > Date.now() - 5 * 60 * 1000) {
         viewerPdf = recentPdfLast.url; // 最近 5 分钟内任何地方出现过的 PDF
@@ -736,6 +741,7 @@ async function runDownloads(job) {
         });
         // 先后台试（不打扰），不行再用前台标签页（保证 JS 挑战能跑起来）
         viewerPdf = await capturePdfViaNavigation(task.url, 20000, false);
+        note("后台截获: " + (viewerPdf || "(无)").slice(0, 120));
         if (!viewerPdf) {
           await emit({
             index,
@@ -745,7 +751,14 @@ async function runDownloads(job) {
             note: "后台没截到，改用前台标签页再试一次…",
           });
           viewerPdf = await capturePdfViaNavigation(task.url, 25000, true);
+          note("前台截获: " + (viewerPdf || "(无)").slice(0, 120));
         }
+      }
+      note("最终采用: " + String(viewerPdf || "(无)").slice(0, 120));
+      try {
+        await chrome.storage.local.set({ elsTrace: trace });
+      } catch (err) {
+        /* ignore */
       }
       if (viewerPdf) {
         target = viewerPdf;
@@ -848,7 +861,9 @@ async function runDownloads(job) {
             total,
             name: task.label,
             state: "fail",
-            error: "拿到的是 Elsevier 的校验页而不是 PDF，已删除",
+            error:
+              "拿到的是校验页而不是 PDF，已删除；用的地址 = " +
+              String(target).slice(0, 130),
           });
           continue;
         }

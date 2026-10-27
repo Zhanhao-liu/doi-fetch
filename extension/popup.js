@@ -929,4 +929,14 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 
   if (job && job.zotero) renderZotero(job.zotero);
+
+  // 展示上次 Elsevier 的追踪（面板关掉再打开也能看到）
+  const traceBox = document.getElementById("traceBox");
+  if (traceBox) {
+    const stored = await chrome.storage.local.get("elsTrace");
+    if (stored.elsTrace && stored.elsTrace.length) {
+      traceBox.hidden = false;
+      traceBox.textContent = "上次 Elsevier 追踪" + String.fromCharCode(10) + stored.elsTrace.join(String.fromCharCode(10));
+    }
+  }
 })();
