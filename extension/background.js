@@ -769,32 +769,36 @@ async function runDownloads(job) {
       if (viewerPdf) target = viewerPdf;
     }
 
-    // Elsevier：完全照搬 Zotero 的做法。
+    // Elsevier：只走「预签名地址」这一条确定可行的路。
     //
-    // Zotero 的 ScienceDirect 翻译器并不在浏览器里下载 PDF，它只是：
-    //   1) 取 #pdfLink（或 citation_pdf_url）
-    //   2) parseIntermediatePDFPage() 抓这张中间页的 meta refresh 目标
-    //   3) 把该目标地址作为附件 URL 交给下载方
-    // 也就是说它下载的是**跳转目标**（哪怕地址里没有 .pdf），而不是原始
-    // /pdfft。我们之前因为"解析结果不像 PDF"就丢弃它、回头下载 /pdfft，
-    // 拿到的自然是挑战页 HTML。
+    // 实测结论：无论 downloads API、页面 fetch、还是照 Zotero 去请求中间页的
+    // 跳转目标，都会被 Elsevier 的 CRA 拦回校验页；而浏览器自己点开 PDF 后，
+    // 标签页地址栏里是 pdf.sciencedirectassets.com 的预签名链接
+    // （?X-Amz-Signature=...），这种地址自带授权，不需要 cookie、不需要过
+    // 校验，直接下载就是 PDF。
+    //
+    // 所以：标签页已经是 PDF 就用它；不是就先让用户点开 PDF，别去撞校验。
     const looksElsevier = /sciencedirect\.com|elsevier\.com/i.test(task.url || "");
     if (index === 0 && looksElsevier) {
-      let resolved = "";
-      const tabs = await chrome.tabs.query({});
-      const page = tabs.find((tab) => /sciencedirect\.com|elsevier\.com/i.test(tab.url || ""));
-      if (page && page.id) {
-        resolved = await resolveElsevierPdf(page.id, target);
-      }
-      if (resolved) {
-        target = resolved; // 照 Zotero：无论它长什么样都用它
+      const viewerPdf = pdfUrlFromTabUrl(await activeTabUrl());
+      if (viewerPdf) {
+        target = viewerPdf;
         await emit({
           index,
           total,
           name: task.label,
           state: "start",
-          note: "已解析出跳转地址，按 Zotero 的方式下载",
+          note: "使用标签页里的 PDF 地址（预签名，无需授权）",
         });
+      } else {
+        await emit({
+          index,
+          total,
+          name: task.label,
+          state: "fail",
+          error: "请先在页面上点『View PDF』把 PDF 打开，再点开始下载",
+        });
+        continue;
       }
     }
 
