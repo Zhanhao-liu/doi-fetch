@@ -1,0 +1,13 @@
+﻿feat(ext): 加入 Elsevier 取证诊断（0.8.6，不改下载行为）
+
+用户指出 Zotero Connector 在同一页面能抓到 PDF，说明路径存在，问题在我的
+实现。静态分析已到尽头，需要一次能看清链路的数据。
+
+新增 deepDiagnoseElsevier（只读，不改任何下载逻辑）：
+- 在页面上下文 fetch 中间页，记录 status / content-type / 长度 / 开头 200 字
+- 若存在 meta refresh，记录其目标
+- 新建临时标签页做真实导航，每 1.5 秒采样一次标签页地址，记录变化序列
+- 判断最终地址能否取出 PDF 地址
+- 结果作为 [取证] 一行输出到「诊断当前页」
+
+同时新增 elsevierInspectRaw 注入函数，仅读取响应，不做跳转。
