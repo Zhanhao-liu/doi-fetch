@@ -968,7 +968,7 @@ async function downloadDirect(url, filename) {
 /** 通路 B：让浏览器导航，用 CDP 在响应阶段读字节（Elsevier / Cloudflare）。 */
 async function downloadViaCdp(tabId, pdfUrl, folder, name) {
   if (tabId < 0) return { ok: false, error: "找不到可用的标签页" };
-  const capped = await capturePdfViaFetchDomain(tabId, pdfUrl, 50000);
+  const capped = await capturePdfViaFetchDomain(tabId, pdfUrl, 35000);
   if (!capped.ok) {
     return {
       ok: false,
@@ -1175,10 +1175,19 @@ function siFilename(url, index) {
  * 不会把验证页落到磁盘上，也省得为几十 MB 的 PDF 先猜后错。
  */
 async function probeDocument(url) {
+  // 必须有超时：某些出版商的 PDF 端点会挂住连接，fetch + reader.read() 会一直等，
+  // 之前 Frontiers 就因为这里没有超时白等了 180 秒。
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
   let response = null;
   try {
-    response = await fetch(url, { credentials: "include", redirect: "follow" });
+    response = await fetch(url, {
+      credentials: "include",
+      redirect: "follow",
+      signal: controller.signal,
+    });
   } catch (err) {
+    clearTimeout(timer);
     return { kind: "error", reason: "连不上：" + (err && err.message) };
   }
   if (!response.ok) {
@@ -1189,8 +1198,13 @@ async function probeDocument(url) {
   let head = "";
   try {
     const reader = response.body.getReader();
-    const chunk = await reader.read();
+    const chunk = await Promise.race([
+      reader.read(),
+      new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
+    ]);
+    clearTimeout(timer);
     reader.cancel().catch(() => {});
+    if (!chunk) return { kind: "error", reason: "读取响应超时" };
     const bytes = (chunk && chunk.value) || new Uint8Array();
     head = new TextDecoder("latin1").decode(bytes.slice(0, 64));
   } catch (err) {
@@ -1217,7 +1231,13 @@ async function probeDocument(url) {
  * requirePdf=true 时只接受 %PDF-；补充材料允许 xlsx/zip/docx 等，但拒绝 HTML。
  */
 async function downloadVerified(url, filename, requirePdf) {
-  const probe = await probeDocument(url);
+  // 路径本来就是 .pdf 的地址不必再探测：探测既慢又可能挂住连接。
+  // 内容是否正确由落盘后的文件名/类型兜底。
+  let probe = { kind: "assumed-pdf" };
+  if (!looksLikeRealPdf(url)) {
+    probe = await probeDocument(url);
+  }
+
 
   // 明确是 HTML 就不必下载了
   if (probe.kind === "html") {
@@ -1225,7 +1245,7 @@ async function downloadVerified(url, filename, requirePdf) {
   }
   // 探测本身失败（跨域、被网关拒、超时）不代表文件有问题——
   // downloads 的请求特征和 fetch 不同，可能只有后者被拦。交给落盘结果裁决。
-  if (probe.kind !== "pdf" && probe.kind !== "error" && requirePdf) {
+  if (probe.kind !== "pdf" && probe.kind !== "assumed-pdf" && probe.kind !== "error" && requirePdf) {
     return { ok: false, reason: "拿到的是 " + probe.kind + "，不是 PDF" };
   }
 
@@ -1236,7 +1256,7 @@ async function downloadVerified(url, filename, requirePdf) {
     return { ok: false, reason: String(err && err.message) };
   }
 
-  const outcome = await waitForDownload(id, 180000);
+  const outcome = await waitForDownload(id, 25000);
   let record = null;
   try {
     const found = await chrome.downloads.search({ id });
@@ -1253,6 +1273,15 @@ async function downloadVerified(url, filename, requirePdf) {
   }
 
   // 兜底：内容类型判断没拦住、却仍然落成网页 → 删掉，别留垃圾
+  // 超时/失败的下载先取消，免得它一直挂在浏览器里拖慢后续
+  if (outcome === "timeout") {
+    try {
+      await chrome.downloads.cancel(id);
+    } catch (err) {
+      /* ignore */
+    }
+  }
+
   try {
     await chrome.downloads.removeFile(id);
   } catch (err) {
@@ -1731,6 +1760,22 @@ async function runBatch(dois, base) {
 
       const candidate = pickPdfUrl(info, base);
 
+      // Elsevier 必须先走 CDP：它的直下一定被 Cloudflare 拒（403 拦截页），
+      // 若先跑点击/变体/辅助标签页那几步，每篇要多花好几分钟，看起来就像卡死。
+      if (candidate && !cdpTried && needsDocumentNavigation(candidate)) {
+        cdpTried = true;
+        item.detail = "用浏览器导航取回 PDF…";
+        await writeBatch(state);
+        const cdp = await downloadViaCdp(tab.id, candidate, folder, "main.pdf");
+        if (cdp.ok) {
+          download = { ok: true, url: candidate };
+          pdf = candidate;
+          break;
+        }
+        item.detail = "导航取字节失败: " + String(cdp.error).slice(0, 70);
+        await writeBatch(state);
+      }
+
       // 需要「文档导航」的出版商（Elsevier / Cloudflare）：只有 CDP 能拿到字节。
       // 批量里必须先走这条，否则旧传输层只会拿到 403 的拦截页。
       if (!candidate) {
@@ -1756,7 +1801,7 @@ async function runBatch(dois, base) {
           item.detail = "已点击页面里的 PDF 链接，等浏览器发起下载…";
           await writeBatch(state);
           nameHint = { folder, name: "main.pdf" };
-          const got = await grabFreshDownload(Date.now(), 8000);
+          const got = await grabFreshDownload(Date.now(), 5000);
           nameHint = null;
           if (got && got.ok) {
             download = got;
@@ -1792,7 +1837,9 @@ async function runBatch(dois, base) {
         ((download && download.reason) || "未知") +
         "），继续等页面刷新…";
       await writeBatch(state);
-      if (attempts >= 3) break;
+      // CDP 已经试过还失败，再重复慢策略没有意义，直接收尾
+      if (cdpTried) break;
+      if (attempts >= 2) break;
     }
 
     // 直接下载都不行时，最后再试一次"另开标签页导航"，避免占用文章页
