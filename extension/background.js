@@ -1088,6 +1088,7 @@ async function runDownloads(job) {
 const BATCH_KEY = "batchState";
 const BATCH_ROOT = "DOI取件器/批量";
 const BATCH_TIMEOUT_MS = 4 * 60 * 1000;
+const ITEM_BUDGET_MS = 90 * 1000; // 单篇硬上限
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1654,8 +1655,11 @@ async function runBatch(dois, base) {
   };
   await writeBatch(state);
 
+  state.running = true;
+  try {
   for (let index = 0; index < state.items.length; index += 1) {
     const item = state.items[index];
+    try {
     state.current = index;
     item.status = "working";
     await writeBatch(state);
@@ -1696,8 +1700,10 @@ async function runBatch(dois, base) {
     let clickAttempted = false;
     let cdpTried = false;
     const tried = new Set();
-    const deadline = Date.now() + BATCH_TIMEOUT_MS;
+    const deadline = Date.now() + Math.min(BATCH_TIMEOUT_MS, ITEM_BUDGET_MS);
     let settleDeadline = 0;
+
+    let candidate = ""; // 循环内外都要用
 
     while (Date.now() < deadline) {
       await sleep(1500);
@@ -1800,7 +1806,7 @@ async function runBatch(dois, base) {
         download = download && download.ok ? download : got;
       }
 
-      const candidate = pickPdfUrl(info, base);
+      candidate = pickPdfUrl(info, base);
 
       // Elsevier 必须先走 CDP：它的直下一定被 Cloudflare 拒（403 拦截页），
       // 若先跑点击/变体/辅助标签页那几步，每篇要多花好几分钟，看起来就像卡死。
@@ -1814,8 +1820,11 @@ async function runBatch(dois, base) {
           pdf = candidate;
           break;
         }
-        item.detail = "导航取字节失败: " + String(cdp.error).slice(0, 70);
+        // 失败就把原因带上并退出本篇：继续跑变体策略只会再花几十秒，且注定拿到网页
+        download = { ok: false, reason: "导航取字节失败：" + String(cdp.error).slice(0, 60) };
+        item.detail = String(download.reason);
         await writeBatch(state);
+        break;
       }
 
       // 需要「文档导航」的出版商（Elsevier / Cloudflare）：只有 CDP 能拿到字节。
@@ -1896,12 +1905,14 @@ async function runBatch(dois, base) {
           download = { ok: true, url: candidate };
           pdf = candidate;
         } else {
-          item.detail = "导航取字节失败: " + String(cdp.error).slice(0, 70);
+          download = { ok: false, reason: "导航取字节失败：" + String(cdp.error).slice(0, 60) };
+          item.detail = String(download.reason);
           await writeBatch(state);
+          break;
         }
       }
 
-if (!(download && download.ok) && pdf) {
+if (!(download && download.ok) && pdf && !cdpTried) {
       try {
         const helper = await chrome.tabs.create({ url: "about:blank", active: false });
         const navigated = await downloadViaNavigation(
@@ -1934,7 +1945,9 @@ if (!(download && download.ok) && pdf) {
       item.saved = download.name;
 
       const siUrls = pickSiUrls(lastInfo, base, pdf);
+      const siDeadline = Date.now() + 40000; // 附件最多再花 40 秒
       for (let n = 0; n < siUrls.length && n < 10; n += 1) {
+        if (Date.now() > siDeadline) break;
         const got = await downloadVerified(
           siUrls[n],
           folder + "/" + siFilename(siUrls[n], n + 1),
@@ -1950,7 +1963,9 @@ if (!(download && download.ok) && pdf) {
       item.detail = download.reason;
     } else {
       const siUrls = pickSiUrls(lastInfo, base, "");
+      const siDeadline = Date.now() + 40000; // 附件最多再花 40 秒
       for (let n = 0; n < siUrls.length && n < 10; n += 1) {
+        if (Date.now() > siDeadline) break;
         const got = await downloadVerified(
           siUrls[n],
           folder + "/" + siFilename(siUrls[n], n + 1),
@@ -1986,7 +2001,26 @@ if (!(download && download.ok) && pdf) {
         /* ignore */
       }
     }
+
+    } catch (err) {
+      item.status = "failed";
+      item.detail = "处理出错: " + String((err && err.message) || err).slice(0, 90);
+      try {
+        await writeBatch(state);
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    }
+  } finally {
+    state.running = false;
+    try {
+      await writeBatch(state);
+    } catch (err) {
+      /* ignore */
+    }
   }
+
 
   state.running = false;
   state.finishedAt = Date.now();

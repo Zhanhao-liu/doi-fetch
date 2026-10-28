@@ -1,0 +1,24 @@
+﻿fix(ext): 批量卡死的真正原因是我引入的作用域错误（0.12.5）
+
+用户反馈批量也卡在同一篇。加入每篇 try/catch 后异常终于暴露出来：
+
+  处理出错: candidate is not defined
+
+candidate 原本在 while 循环内用 const 声明，而我上一版把「通用 CDP 兜底」插到了
+循环之外，那里引用 candidate 直接抛 ReferenceError。异常又没有人接，runBatch
+就此中断，state.running 永远停在 true —— 表现就是"卡死"。
+
+修复：
+- candidate 提升到循环外声明，循环内改为赋值
+- 每篇包一层 try/catch：单篇出错只标记该篇失败，附上错误文本，不中断整批
+- 整个循环包 try/finally：无论如何都把 running 置回 false，界面不会永远转圈
+- 每篇硬上限 90 秒（ITEM_BUDGET_MS），附件阶段单独 40 秒预算
+- CDP 失败立即带原因退出该篇，不再继续跑注定的慢策略
+- 最终导航兜底只在 CDP 没试过时才用，超时 60s→25s
+- 移除临时插桩
+
+实测（我这台机器的网络里 AGU/ACS 被 Cloudflare 拦）：
+- AGU：6 秒内识别为验证页并失败，不再挂住
+- ACS：100 秒内失败
+- Nature：正常 downloaded + 3 个附件
+- 整批 244 秒跑完，running 正常复位
