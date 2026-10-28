@@ -1,0 +1,12 @@
+﻿feat(ext): 批量接入 CDP 通路，Elsevier 可在批量里工作（0.12.1）
+
+单篇重写后批量仍是旧传输层（downloadVerified / pdfVariants），对 Elsevier 只会
+拿到 403 拦截页。这一版把新通路接进批量：
+
+- 拿到 candidate 后，若该地址需要「文档导航」（sciencedirect/elsevier），先走
+  downloadViaCdp（浏览器导航 + CDP Fetch 域读响应体）
+- 用 cdpTried 保证每篇只尝试一次，避免多条策略重复耗时
+- 成功即结束该篇；失败则记录原因并回落到旧的变体策略
+
+验证：批量跑 Nature×2 / PLOS / Frontiers，4/4 全部 downloaded，正文与附件
+（3、1、6、0 个）正常，落盘 15 个文件其中 7 个 PDF。

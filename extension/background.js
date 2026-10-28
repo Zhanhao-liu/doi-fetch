@@ -1623,6 +1623,7 @@ async function runBatch(dois, base) {
     let attempts = 0;
     let viewerSeen = false;
     let clickAttempted = false;
+    let cdpTried = false;
     const tried = new Set();
     const deadline = Date.now() + BATCH_TIMEOUT_MS;
     let settleDeadline = 0;
@@ -1729,6 +1730,23 @@ async function runBatch(dois, base) {
       }
 
       const candidate = pickPdfUrl(info, base);
+
+      // 需要「文档导航」的出版商（Elsevier / Cloudflare）：只有 CDP 能拿到字节。
+      // 批量里必须先走这条，否则旧传输层只会拿到 403 的拦截页。
+      if (candidate && !cdpTried && needsDocumentNavigation(candidate)) {
+        cdpTried = true;
+        item.detail = "用浏览器导航取回 PDF…";
+        await writeBatch(state);
+        const cdp = await downloadViaCdp(tab.id, candidate, folder, "main.pdf");
+        if (cdp.ok) {
+          download = { ok: true, url: candidate };
+          pdf = candidate;
+          break;
+        }
+        item.detail = "导航取字节失败: " + String(cdp.error).slice(0, 70);
+        await writeBatch(state);
+      }
+
       if (!candidate) {
         if (info.ready === "complete" && !settleDeadline) settleDeadline = Date.now() + 20000;
         if (settleDeadline && Date.now() > settleDeadline) break;
