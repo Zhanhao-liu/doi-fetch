@@ -927,7 +927,11 @@ async function clickInActiveTab() {
 
 /** 该出版商的 PDF 只能用「浏览器文档导航」拿到（Cloudflare 只放行这种请求）。 */
 function needsDocumentNavigation(pdfUrl) {
-  return /sciencedirect\.com|elsevier\.com/i.test(String(pdfUrl || ""));
+  // 这些出版社都在 Cloudflare 后面：直下必然拿到拦截页，只能靠浏览器导航取字节。
+  // 名单可继续扩充——不在名单里的也会在直下失败后自动回退到 CDP。
+  return /sciencedirect\.com|elsevier\.com|onlinelibrary\.wiley\.com|agupubs|tandfonline|sagepub|pubs\.acs\.org|pubs\.rsc\.org|iopscience|link\.aps\.org|journals\.aps\.org/i.test(
+    String(pdfUrl || "")
+  );
 }
 
 /** 当前活动标签页 id（拿不到就返回 -1）。 */
@@ -941,6 +945,14 @@ async function activeTabId() {
 }
 
 /** 通路 A：直接下载（对绝大多数出版社有效）。 */
+/** 落盘结果是不是网页？只看文件名不够——Chrome 有时不给 .html 后缀。 */
+function looksLikeHtmlDownload(record) {
+  if (!record) return false;
+  const name = String(record.filename || "");
+  const mime = String(record.mime || "").toLowerCase();
+  return /\.html?$/i.test(name) || mime.startsWith("text/html") || mime.startsWith("application/xhtml");
+}
+
 async function downloadDirect(url, filename) {
   const startedAt = Date.now();
   try {
@@ -948,9 +960,21 @@ async function downloadDirect(url, filename) {
   } catch (err) {
     return { ok: false, error: "下载失败: " + String((err && err.message) || err) };
   }
-  const done = await waitForNewDownload(startedAt, 120000);
+  const done = await waitForNewDownload(startedAt, 40000);
   if (!done.ok) return { ok: false, error: "下载未完成或被浏览器中断" };
-  if (/\.html?$/i.test(done.filename)) {
+
+  let record = null;
+  try {
+    const items = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 5 });
+    record =
+      (items || []).find(
+        (it) => new Date(it.startTime).getTime() >= startedAt - 2000
+      ) || null;
+  } catch (err) {
+    record = null;
+  }
+
+  if (looksLikeHtmlDownload(record)) {
     try {
       const items = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 1 });
       if (items[0]) {
@@ -1010,6 +1034,24 @@ async function runDownloads(job) {
     } else {
       trace.push("通路 A（直接下载）: " + String(task.url).slice(0, 110));
       result = await downloadDirect(task.url, root + "/" + task.name);
+      // 直下拿到网页/被拦时，改用浏览器导航取字节（和批量同样的策略链）
+      if (!result.ok) {
+        const tabId = await activeTabId();
+        if (tabId >= 0) {
+          trace.push("直下失败，回退 CDP: " + String(result.error).slice(0, 80));
+          await emit({
+            index,
+            total,
+            name: task.label,
+            state: "start",
+            note: "直下被拦，改用浏览器导航取回…",
+          });
+          const cdp = await downloadViaCdp(tabId, task.url, root, task.name);
+          result = cdp.ok
+            ? cdp
+            : { ok: false, error: String(result.error) + " / " + String(cdp.error) };
+        }
+      }
     }
 
     if (result.ok) {
@@ -1266,7 +1308,7 @@ async function downloadVerified(url, filename, requirePdf) {
   }
 
   const savedName = record ? String(record.filename || "").split(/[\\/]/).pop() : "";
-  const landedHtml = /\.html?$/i.test(savedName);
+  const landedHtml = looksLikeHtmlDownload(record);
 
   if (outcome === "complete" && !landedHtml) {
     return { ok: true, name: savedName, size: (record && record.fileSize) || 0 };

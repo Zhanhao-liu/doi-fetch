@@ -1,0 +1,20 @@
+﻿fix(ext): 单篇也走策略链；HTML 判定改用 MIME（0.12.4）
+
+用户反馈卡在 10.1029/2024JD040906 并提示"拿到的是网页而不是 PDF，已删除"。
+该提示来自单篇的 downloadDirect —— 说明单篇对这一篇只做了直下，没有 CDP 兜底。
+
+根因：needsDocumentNavigation() 只认 sciencedirect|elsevier，AGU/Wiley/ACS/RSC
+等 Cloudflare 出版社不在其中；批量后来加了通用兜底，但单篇一直没有。
+
+改动：
+- 单篇改为策略链：直下 → 失败则 CDP 导航取字节 → 合并两边的失败原因
+- needsDocumentNavigation 扩到 wiley/agupubs/tandfonline/sagepub/acs/rsc/iopscience/aps
+  （不在名单里的仍会在直下失败后自动回退 CDP）
+- 新增 looksLikeHtmlDownload()：文件名 + MIME 双判定。之前只看文件名，
+  而 Chrome 有时不给 .html 后缀，导致一个 425KB 的网页被当成"成功"
+- 单篇与批量的落盘校验都改用它；单篇直下等待 120s→40s
+
+实测：
+- 网页地址当正文 → 判定为网页 → 删除 → 自动回退 CDP → 干净失败，无垃圾文件
+- 正常 PDF → 3170KB %PDF-
+- 3 篇批量 66.1 秒，全部 downloaded，落盘 12 个文件且 HTML 为 0
