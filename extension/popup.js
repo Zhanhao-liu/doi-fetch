@@ -922,7 +922,13 @@ chrome.runtime.onMessage.addListener((message) => {
       el.tip.innerHTML =
         "另一个任务正在进行，等它完成后再开始新的。进度见上方横幅，也可以直接关掉面板——下载会继续。";
     }
-  } else if (job && job.tasks && job.tasks.length) {
+  } else if (
+    job &&
+    job.tasks &&
+    job.tasks.length &&
+    // 只有同一个 DOI 才复用上一次的任务列表，否则会显示上一篇的条目
+    (!job.doi || !state.info || !state.info.doi || job.doi === state.info.doi)
+  ) {
     // 上一次已完成/未完成：也把文件列出来，方便确认存了几个
     state.tasks = job.tasks;
     renderRows();

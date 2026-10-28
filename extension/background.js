@@ -537,52 +537,6 @@ function looksLikeRealPdf(url) {
   }
 }
 
-function pdfUrlFromTabUrl(url) {
-  const raw = String(url || "");
-  if (!raw) return "";
-
-  // 情况一：Chrome 内置阅读器，地址是 chrome-extension://...?file=<编码后的 PDF 地址>
-  if (/^chrome-extension:\/\//i.test(raw)) {
-    try {
-      const parsed = new URL(raw);
-      const file = parsed.searchParams.get("file");
-      if (file) return file;
-    } catch (err) {
-      /* ignore */
-    }
-    const hashMatch = raw.match(/[#&]file=([^&]+)/);
-    if (hashMatch) {
-      try {
-        return decodeURIComponent(hashMatch[1]);
-      } catch (err) {
-        /* ignore */
-      }
-    }
-    // 兜底：无论地址长什么样，只要整串里嵌着一个 http(s) 的 .pdf 地址就解出来
-    try {
-      const decoded = decodeURIComponent(raw);
-      const inner = decoded.match(/https?:\/\/[^\s"'<>]+?\.pdf(\?[^\s"'<>]*)?/i);
-      if (inner && looksLikeRealPdf(inner[0])) return inner[0];
-    } catch (err) {
-      /* ignore */
-    }
-    return "";
-  }
-
-  // 情况二：标签页地址本身就是 PDF（含 pdf.sciencedirectassets.com 的签名地址）
-  if (looksLikeRealPdf(raw)) return raw;
-
-  // 情况三：地址里嵌着 PDF 地址（少见但存在）
-  try {
-    const decoded = decodeURIComponent(raw);
-    const inner = decoded.match(/https?:\/\/[^\s"'<>]+?\.pdf(\?[^\s"'<>]*)?/i);
-    if (inner && looksLikeRealPdf(inner[0])) return inner[0];
-  } catch (err) {
-    /* ignore */
-  }
-  return "";
-}
-
 /* 记录每个标签页最近出现过的 PDF 地址。
  *
  * 为什么需要：Chrome 内置 PDF 阅读器的标签页属于另一个扩展的内部页，
@@ -876,170 +830,10 @@ async function saveBase64Pdf(base64, folder, name) {
       conflictAction: "uniquify",
     });
   } catch (err) {
-    return { ok: false, error: "下载失败: " + String((err && err.message) || err).slice(0, 100) };
+    return { ok: false, error: "下载失败: " + String((err && err.message) || err) };
   }
   const done = await waitForNewDownload(startedAt, 90000);
   return { ok: done.ok, file: done.filename.slice(-40) };
-}
-
-async function savePdfFromServiceWorker(url, folder, name) {
-  const startedAt = Date.now();
-  const attempts = [];
-  let buffer = null;
-  let okResponse = null;
-
-  // 预签名地址本身带授权，不需要 cookie；带 cookie 反而可能被 CDN 当成异常请求。
-  // 先不带，再带，两次都记录结果。
-  for (const credentials of ["omit", "include"]) {
-    let response = null;
-    try {
-      response = await fetch(url, { credentials });
-    } catch (err) {
-      attempts.push({ credentials, error: String((err && err.message) || err).slice(0, 90) });
-      continue;
-    }
-
-    let buf = null;
-    try {
-      buf = await response.arrayBuffer();
-    } catch (err) {
-      attempts.push({ credentials, status: response.status, error: "读取响应失败" });
-      continue;
-    }
-
-    const bytes = new Uint8Array(buf);
-    const isPdf =
-      bytes.length > 4 &&
-      bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
-
-    if (isPdf) {
-      buffer = buf;
-      okResponse = response;
-      attempts.push({ credentials, status: response.status, pdf: true, size: bytes.length });
-      break;
-    }
-
-    let head = "";
-    try {
-      head = new TextDecoder().decode(bytes.slice(0, 160)).replace(/\s+/g, " ");
-    } catch (err) {
-      head = "";
-    }
-    attempts.push({
-      credentials,
-      status: response.status,
-      type: (response.headers.get("content-type") || "").slice(0, 30),
-      size: bytes.length,
-      head,
-    });
-  }
-
-  if (!buffer) {
-    return { ok: false, detail: { attempts } };
-  }
-
-  let made = null;
-  try {
-    await ensureOffscreen();
-    made = await chrome.runtime.sendMessage({
-      type: "blobDownload",
-      base64: bytesToBase64(new Uint8Array(buffer)),
-    });
-  } catch (err) {
-    return {
-      ok: false,
-      detail: { attempts, error: "offscreen 生成 Blob 失败: " + String((err && err.message) || err).slice(0, 100) },
-    };
-  }
-
-  if (!made || !made.ok || !made.objectUrl) {
-    return { ok: false, detail: { attempts, error: (made && made.error) || "未生成 Blob 地址" } };
-  }
-
-  try {
-    await startDownload({
-      url: made.objectUrl,
-      filename: folder + "/" + name,
-      saveAs: false,
-      conflictAction: "uniquify",
-    });
-  } catch (err) {
-    return {
-      ok: false,
-      detail: { attempts, error: "Blob 下载失败: " + String((err && err.message) || err).slice(0, 100) },
-    };
-  }
-
-  const result = await waitForNewDownload(startedAt, 60000);
-  return {
-    ok: result.ok,
-    detail: {
-      attempts,
-      status: okResponse ? okResponse.status : 0,
-      size: new Uint8Array(buffer).length,
-      file: result.filename.slice(-40),
-    },
-  };
-}
-
-async function savePdfViaBlob(tabId, url, folder, name) {
-  nameHint = { folder, name };
-  let result = null;
-  try {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      func: fetchPdfAsBlob,
-      args: [url, name],
-    });
-    result = (res && res.result) || null;
-  } catch (err) {
-    result = { ok: false, error: String((err && err.message) || err).slice(0, 120) };
-  }
-
-  if (!result || !result.ok) {
-    nameHint = null;
-    return { ok: false, detail: result || {} };
-  }
-
-  const startedAt = Date.now();
-  const got = await waitForNewDownload(startedAt - 30000, 30000);
-  nameHint = null;
-  return { ok: !!got.ok, detail: result, download: got };
-}
-
-async function capturePdfViaNavigation(url, timeoutMs, active) {
-  const start = Date.now();
-  let tabId = -1;
-  try {
-    const tab = await chrome.tabs.create({ url, active: !!active });
-    tabId = tab && tab.id >= 0 ? tab.id : -1;
-  } catch (err) {
-    return "";
-  }
-
-  const deadline = start + (timeoutMs || 25000);
-  let found = "";
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    const perTab = tabId >= 0 ? recentPdfForTab(tabId) : "";
-    if (perTab) {
-      found = perTab;
-      break;
-    }
-    if (recentPdfLast.at > start && recentPdfLast.url) {
-      found = recentPdfLast.url;
-      break;
-    }
-  }
-
-  if (tabId >= 0) {
-    try {
-      await chrome.tabs.remove(tabId);
-    } catch (err) {
-      /* ignore */
-    }
-  }
-  return found;
 }
 
 /**
@@ -1051,54 +845,6 @@ async function capturePdfViaNavigation(url, timeoutMs, active) {
  *
  * 注入执行，必须自包含。
  */
-async function fetchPdfAsBlob(url, fileName) {
-  try {
-    const response = await fetch(url, { credentials: "include" });
-    const buffer = await response.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
-    const isPdf =
-      bytes.length > 4 &&
-      bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46;
-
-    if (!isPdf) {
-      let head = "";
-      try {
-        head = new TextDecoder().decode(bytes.slice(0, 240)).replace(/\s+/g, " ");
-      } catch (err) {
-        head = "";
-      }
-      return {
-        ok: false,
-        status: response.status,
-        type: (response.headers.get("content-type") || "").slice(0, 40),
-        size: bytes.length,
-        head,
-      };
-    }
-
-    const blob = new Blob([buffer], { type: "application/pdf" });
-    const objectUrl = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = objectUrl;
-    anchor.download = fileName || "main.pdf";
-    anchor.style.display = "none";
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    setTimeout(() => {
-      try {
-        URL.revokeObjectURL(objectUrl);
-      } catch (err) {
-        /* ignore */
-      }
-    }, 120000);
-
-    return { ok: true, status: response.status, size: bytes.length };
-  } catch (err) {
-    return { ok: false, error: String((err && err.message) || err).slice(0, 160) };
-  }
-}
-
 /* 给 Elsevier 的 CDN 请求补上 Referer / Origin。
  *
  * 浏览器点开 PDF 时是导航请求，带 Referer 和完整的 Sec-Fetch 头；扩展发起的
@@ -1146,16 +892,6 @@ try {
 }
 
 /** 判断某个 PDF 地址是否属于当前这篇（按 PII 或 DOI 片段比对）。 */
-function pdfBelongsToPaper(pdfUrl, taskUrl) {
-  const pdf = String(pdfUrl || "").toUpperCase();
-  if (!pdf) return false;
-  const piiMatch = String(taskUrl || "").match(/\/pii\/([A-Za-z0-9]+)/i);
-  if (piiMatch) return pdf.includes(piiMatch[1].toUpperCase());
-  const doiMatch = String(taskUrl || "").match(/10\.\d{4,9}\/[^\s?&#]+/);
-  if (doiMatch) return pdf.includes(doiMatch[0].toUpperCase());
-  return false; // 认不出归属就别用历史记录，宁可重新捕获
-}
-
 async function activeTabUrl() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -1179,306 +915,122 @@ async function clickInActiveTab() {
   }
 }
 
+/* ============================ 单篇下载 ============================
+ * 结构参考 fetchpdf / Aut_Sci_Download 的共同做法：
+ *   1. planTask   —— 只看「当前这一篇」的信息决定走哪条通路
+ *   2. execute    —— 执行通路，只返回结果，不读任何跨论文的缓存
+ *   3. 归档       —— 由通路自己把字节交给下载器
+ *
+ * 之前把缓存兜底、多策略回退、地址猜测全塞在一个函数里，才出现"换一篇仍保存
+ * 上一篇"。这里彻底去掉那些跨论文状态：地址永远来自当前任务的 URL。
+ * ================================================================= */
+
+/** 该出版商的 PDF 只能用「浏览器文档导航」拿到（Cloudflare 只放行这种请求）。 */
+function needsDocumentNavigation(pdfUrl) {
+  return /sciencedirect\.com|elsevier\.com/i.test(String(pdfUrl || ""));
+}
+
+/** 当前活动标签页 id（拿不到就返回 -1）。 */
+async function activeTabId() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return tab && tab.id >= 0 ? tab.id : -1;
+  } catch (err) {
+    return -1;
+  }
+}
+
+/** 通路 A：直接下载（对绝大多数出版社有效）。 */
+async function downloadDirect(url, filename) {
+  const startedAt = Date.now();
+  try {
+    await startDownload({ url, filename, saveAs: false, conflictAction: "uniquify" });
+  } catch (err) {
+    return { ok: false, error: "下载失败: " + String((err && err.message) || err) };
+  }
+  const done = await waitForNewDownload(startedAt, 120000);
+  if (!done.ok) return { ok: false, error: "下载未完成或被浏览器中断" };
+  if (/\.html?$/i.test(done.filename)) {
+    try {
+      const items = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 1 });
+      if (items[0]) {
+        await chrome.downloads.removeFile(items[0].id);
+        await chrome.downloads.erase({ id: items[0].id });
+      }
+    } catch (err) {
+      /* ignore */
+    }
+    return { ok: false, error: "拿到的是网页而不是 PDF，已删除" };
+  }
+  return { ok: true };
+}
+
+/** 通路 B：让浏览器导航，用 CDP 在响应阶段读字节（Elsevier / Cloudflare）。 */
+async function downloadViaCdp(tabId, pdfUrl, folder, name) {
+  if (tabId < 0) return { ok: false, error: "找不到可用的标签页" };
+  const capped = await capturePdfViaFetchDomain(tabId, pdfUrl, 50000);
+  if (!capped.ok) {
+    return {
+      ok: false,
+      error: "导航取字节失败: " + String(capped.error).slice(0, 80),
+      seen: capped.seen,
+    };
+  }
+  const saved = await saveBase64Pdf(capped.base64, folder, name);
+  if (!saved.ok) {
+    return { ok: false, error: "保存失败: " + String(saved.error).slice(0, 80) };
+  }
+  return { ok: true };
+}
+
 async function runDownloads(job) {
   const { tasks, root } = job;
   const total = tasks.length;
   let done = 0;
+  const trace = [];
 
-  for (let index = 0; index < tasks.length; index += 1) {
+  for (let index = 0; index < total; index += 1) {
     const task = tasks[index];
+    const isBody = index === 0;
     await emit({ index, total, name: task.label, state: "start" });
 
-    // 唯一保留的增强：正文任务若当前标签页本身就是 PDF（Elsevier 会落到
-    // pdf.sciencedirectassets.com 的签名地址），优先用那个地址。
-    // 其余一律恢复成最朴素的行为：直接下载 → 等完成 → 报结果。
-    let target = task.url;
-    if (index === 0) {
-      const viewerPdf = pdfUrlFromTabUrl(await activeTabUrl());
-      if (viewerPdf) target = viewerPdf;
+    let result;
+    if (isBody && needsDocumentNavigation(task.url)) {
+      trace.push("通路 B（导航取字节）: " + String(task.url).slice(0, 110));
+      await emit({
+        index,
+        total,
+        name: task.label,
+        state: "start",
+        note: "用浏览器导航取回 PDF…",
+      });
+      const tabId = await activeTabId();
+      trace.push("标签页 id: " + tabId);
+      result = await downloadViaCdp(tabId, task.url, root, task.name);
+    } else {
+      trace.push("通路 A（直接下载）: " + String(task.url).slice(0, 110));
+      result = await downloadDirect(task.url, root + "/" + task.name);
     }
 
-    // Elsevier：只走「预签名地址」这一条确定可行的路。
-    //
-    // 实测结论：无论 downloads API、页面 fetch、还是照 Zotero 去请求中间页的
-    // 跳转目标，都会被 Elsevier 的 CRA 拦回校验页；而浏览器自己点开 PDF 后，
-    // 标签页地址栏里是 pdf.sciencedirectassets.com 的预签名链接
-    // （?X-Amz-Signature=...），这种地址自带授权，不需要 cookie、不需要过
-    // 校验，直接下载就是 PDF。
-    //
-    // 所以：标签页已经是 PDF 就用它；不是就先让用户点开 PDF，别去撞校验。
-    const looksElsevier = /sciencedirect\.com|elsevier\.com/i.test(task.url || "");
-    if (index === 0 && looksElsevier) {
-      const trace = [];
-      const note = (line) => trace.push(line);
-      note("任务地址: " + String(task.url).slice(0, 120));
-      let activeTab = null;
-      try {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        activeTab = tab || null;
-      } catch (err) {
-        activeTab = null;
-      }
-      note("标签页地址: " + String((activeTab && (activeTab.url || activeTab.pendingUrl)) || "(空)").slice(0, 120));
-      let viewerPdf = pdfUrlFromTabUrl((activeTab && (activeTab.url || activeTab.pendingUrl)) || "");
-      if (!viewerPdf && activeTab && activeTab.id >= 0) {
-        const perTab = recentPdfForTab(activeTab.id);
-        // 必须属于本篇，否则会把上一篇的地址拿来用
-        if (perTab && pdfBelongsToPaper(perTab, task.url)) {
-          viewerPdf = perTab;
-        }
-        note("本标签页网络记录: " + (perTab || "(无)").slice(0, 110) +
-             (perTab && !viewerPdf ? "（不属于本篇，已忽略）" : ""));
-      }
-      if (!viewerPdf && recentPdfLast.at > Date.now() - 5 * 60 * 1000) {
-        if (pdfBelongsToPaper(recentPdfLast.url, task.url)) {
-          viewerPdf = recentPdfLast.url;
-          note("沿用最近的同篇记录");
-        } else {
-          note("最近记录属于别的论文，已忽略: " + recentPdfLast.url.slice(0, 90));
-        }
-      }
-      if (!viewerPdf) {
-        await emit({
-          index,
-          total,
-          name: task.label,
-          state: "start",
-          note: "正在后台请求 PDF，从网络层截取真实地址…",
-        });
-        // 先后台试（不打扰），不行再用前台标签页（保证 JS 挑战能跑起来）
-        viewerPdf = await capturePdfViaNavigation(task.url, 20000, false);
-        note("后台截获: " + (viewerPdf || "(无)").slice(0, 120));
-        if (!viewerPdf) {
-          await emit({
-            index,
-            total,
-            name: task.label,
-            state: "start",
-            note: "后台没截到，改用前台标签页再试一次…",
-          });
-          viewerPdf = await capturePdfViaNavigation(task.url, 25000, true);
-          note("前台截获: " + (viewerPdf || "(无)").slice(0, 120));
-        }
-      }
-      note("最终采用: " + String(viewerPdf || "(无)").slice(0, 120));
-      const persist = async () => {
-        try {
-          await chrome.storage.local.set({ elsTrace: trace });
-        } catch (err) {
-          /* ignore */
-        }
-      };
-      await persist();
-      if (viewerPdf) {
-        // 先试页面内取字节 + Blob 保存（绕开下载请求被拦的问题）
-        const tabId = activeTab && activeTab.id >= 0 ? activeTab.id : -1;
-
-        // 方案零：CDP 拦截浏览器自身导航的响应（能绕过 Cloudflare 的请求类型检查）
-        if (tabId >= 0) {
-          await emit({
-            index,
-            total,
-            name: task.label,
-            state: "start",
-            note: "用浏览器自身导航取回 PDF…",
-          });
-          const cdp = await capturePdfViaFetchDomain(tabId, viewerPdf, 45000);
-          if (cdp.ok) {
-            note("CDP: 成功 " + Math.round((cdp.base64.length * 3) / 4 / 1024) + "KB");
-            const saved = await saveBase64Pdf(cdp.base64, root, task.name);
-            if (saved.ok) {
-              done += 1;
-              await emit({ index, total, name: task.label, state: "ok" });
-              await persist();
-              continue;
-            }
-            note("CDP 保存失败: " + String(saved.error).slice(0, 100));
-          } else {
-            note(
-              "CDP: " + String(cdp.error).slice(0, 80) +
-                " seen=" + JSON.stringify(cdp.seen || []).slice(0, 140)
-            );
-          }
-        }
-
-        // 方案一：后台 fetch + Blob（不受跨域限制，也不走服务器）
-        await emit({
-          index,
-          total,
-          name: task.label,
-          state: "start",
-          note: "在后台取 PDF 字节，用 Blob 保存…",
-        });
-        const bySw = await savePdfFromServiceWorker(viewerPdf, root, task.name);
-        note("后台 Blob: " + JSON.stringify(bySw.detail).slice(0, 160));
-        if (bySw.ok) {
-          done += 1;
-          await emit({ index, total, name: task.label, state: "ok" });
-          await persist();
-          continue;
-        }
-
-        // 方案二：页面内 fetch + Blob
-        if (tabId >= 0) {
-          await emit({
-            index,
-            total,
-            name: task.label,
-            state: "start",
-            note: "改用页面内取字节…",
-          });
-          const byBlob = await savePdfViaBlob(tabId, viewerPdf, root, task.name);
-          if (byBlob.ok) {
-            done += 1;
-            await emit({ index, total, name: task.label, state: "ok" });
-            await persist();
-            continue;
-          }
-          note("页面 Blob: " + JSON.stringify(byBlob.detail).slice(0, 160));
-          try {
-            await chrome.storage.local.set({ elsTrace: trace.concat(["Blob 方式失败: " + JSON.stringify(byBlob.detail).slice(0, 200)]) });
-          } catch (err) {
-            /* ignore */
-          }
-        }
-        target = viewerPdf;
-        await emit({
-          index,
-          total,
-          name: task.label,
-          state: "start",
-          note: "改用直接下载（Blob 方式未成功）",
-        });
-      } else {
-        let where = "";
-        try {
-          where = await activeTabUrl();
-        } catch (err) {
-          where = "";
-        }
-        await emit({
-          index,
-          total,
-          name: task.label,
-          state: "fail",
-          error:
-            "没取到 PDF 地址；当前标签页 = " +
-            (where ? where.slice(0, 110) : "(空)") +
-            "。请把这段发我",
-        });
-        continue;
-      }
-    }
-
-    // 兜底：target 必须是合法 http(s)，否则回退到原始任务地址
-    if (!/^https?:/i.test(target || "")) target = task.url;
-
-    // 中间页（/pdfft、/pdf）不可能是正文本身，下下来只会是校验页
-    if (index === 0 && /\/(pdfft|pdf)(\?|$)/i.test(new URL(target, "https://x.invalid").pathname)) {
+    if (result.ok) {
+      done += 1;
+      trace.push("结果: 成功");
+      await emit({ index, total, name: task.label, state: "ok" });
+    } else {
+      trace.push("结果: 失败 — " + String(result.error).slice(0, 140));
       await emit({
         index,
         total,
         name: task.label,
         state: "fail",
-        error: "只拿到中间页地址（" + String(target).slice(0, 60) + "），没截到真正的 PDF",
+        error: String(result.error).slice(0, 160),
       });
-      continue;
-    }
-
-    // 明显的静态资源一定不是正文，别下
-    if (/\.(js|mjs|css|woff2?|ttf|eot|svg|png|jpe?g|gif|webp|ico|map)(\?|$)/i.test(target || "")) {
-      await emit({
-        index,
-        total,
-        name: task.label,
-        state: "fail",
-        error: "地址指向的是网站资源而不是文献文件，已跳过",
-      });
-      continue;
-    }
-    if (!/^https?:/i.test(target || "")) {
-      await emit({
-        index,
-        total,
-        name: task.label,
-        state: "fail",
-        error: "页面里没有可用的下载地址（拿到的是 " + String(task.url || "").slice(0, 40) + "）",
-      });
-      continue;
     }
 
     try {
-      const id = await startDownload({
-        url: target,
-        filename: root + "/" + task.name,
-        saveAs: false,
-        conflictAction: "uniquify",
-      });
-      const state = await waitForDownload(id, 180000);
-
-      // Elsevier 正文若仍落成网页，说明 CRA 校验没过：删掉并说清楚
-      if (state === "complete" && index === 0 && looksElsevier) {
-        let savedName = "";
-        try {
-          const found = await chrome.downloads.search({ id });
-          savedName = String((found && found[0] && found[0].filename) || "");
-        } catch (err) {
-          savedName = "";
-        }
-        note("直下结果: " + savedName.split(/[\\/]/).pop() + " (state=" + state + ")");
-        try {
-          await chrome.storage.local.set({ elsTrace: trace });
-        } catch (err) {
-          /* ignore */
-        }
-        if (/\.html?$/i.test(savedName)) {
-          try {
-            await chrome.downloads.removeFile(id);
-          } catch (err) {
-            /* ignore */
-          }
-          try {
-            await chrome.downloads.erase({ id });
-          } catch (err) {
-            /* ignore */
-          }
-          await emit({
-            index,
-            total,
-            name: task.label,
-            state: "fail",
-            error:
-              "拿到的是校验页而不是 PDF，已删除；用的地址 = " +
-              String(target).slice(0, 130) +
-              "｜追踪：" +
-              trace.slice(-2).join(" / ").slice(0, 200),
-          });
-          continue;
-        }
-      }
-
-      if (state === "complete") {
-        done += 1;
-        if (index === 0 && looksElsevier) {
-          note("直下成功");
-          try {
-            await chrome.storage.local.set({ elsTrace: trace });
-          } catch (err) {
-            /* ignore */
-          }
-        }
-        await emit({ index, total, name: task.label, state: "ok" });
-      } else {
-        await emit({
-          index,
-          total,
-          name: task.label,
-          state: "fail",
-          error: state === "interrupted" ? "被浏览器中断" : "超时",
-        });
-      }
+      await chrome.storage.local.set({ elsTrace: trace.slice(-14) });
     } catch (err) {
-      await emit({ index, total, name: task.label, state: "fail", error: err.message });
+      /* ignore */
     }
   }
 

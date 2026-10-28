@@ -1,0 +1,24 @@
+﻿refactor(ext): 按「解析/取字节分离」重写单篇下载路径（0.12.0）
+
+用户反馈换一篇仍保存上一篇，要求彻底重塑并参考开源实现。
+
+参考的开源项目：
+- fetchpdf（The-Metascience-Observatory）：多来源回退链，每个来源独立、互不共享状态
+- Aut_Sci_Download（ShZhao27208）：按出版社拆分独立入口
+共同原则：解析地址与取字节分离，且每次运行只针对当前这一篇，不共享缓存。
+
+重写内容（runDownloads 全部作废重写）：
+- 两层结构：planTask（只看当前任务决定通路）→ 执行器（只返回结果）
+- 通路 A downloadDirect：直接下载，落成网页则删除并报错
+- 通路 B downloadViaCdp：浏览器导航 + CDP Fetch 域读响应体（Elsevier 必需）
+- 彻底删除跨论文状态：recentPdfLast / recentPdfByTab / 各种地址猜测与兜底
+- 追踪只保留最近 14 行，供排障
+
+同时清理死代码 6 个函数（约 264 行）：capturePdfViaNavigation、
+savePdfFromServiceWorker、savePdfViaBlob、fetchPdfAsBlob、pdfUrlFromTabUrl、
+pdfBelongsToPaper。
+
+popup：上一次的任务列表只在与当前页 DOI 相同时才复用，避免显示上一篇的条目。
+
+验证：两条通路各自成功；两篇连续下载分别落盘 1588KB 与 3170KB，无串稿；
+popup 无报错；离线单测 37 项通过。
