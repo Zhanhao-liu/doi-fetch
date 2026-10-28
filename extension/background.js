@@ -1063,7 +1063,7 @@ function sniffPage() {
     .map((anchor) => anchor.href)
     .filter((href) => /\/pdfft|\.pdf(\?|$)|\/pdf(\?|$)/i.test(href));
   // 注意：注入到页面的函数必须自包含，不能引用 service worker 里的变量
-  const siPattern = /supplement|supporting|moesm|_esm|_si_|appendix|additional-file|补充|附加/i;
+  const siPattern = /supplement|supporting|moesm|_esm|_si_|appendix|additional-file|mmc\d|sapp\d|suppl_file/i;
   const siLinks = anchors
     .filter((anchor) => siPattern.test(anchor.href) || siPattern.test(anchor.textContent || ""))
     .map((anchor) => anchor.href);
@@ -1733,20 +1733,6 @@ async function runBatch(dois, base) {
 
       // 需要「文档导航」的出版商（Elsevier / Cloudflare）：只有 CDP 能拿到字节。
       // 批量里必须先走这条，否则旧传输层只会拿到 403 的拦截页。
-      if (candidate && !cdpTried && needsDocumentNavigation(candidate)) {
-        cdpTried = true;
-        item.detail = "用浏览器导航取回 PDF…";
-        await writeBatch(state);
-        const cdp = await downloadViaCdp(tab.id, candidate, folder, "main.pdf");
-        if (cdp.ok) {
-          download = { ok: true, url: candidate };
-          pdf = candidate;
-          break;
-        }
-        item.detail = "导航取字节失败: " + String(cdp.error).slice(0, 70);
-        await writeBatch(state);
-      }
-
       if (!candidate) {
         if (info.ready === "complete" && !settleDeadline) settleDeadline = Date.now() + 20000;
         if (settleDeadline && Date.now() > settleDeadline) break;
@@ -1810,7 +1796,23 @@ async function runBatch(dois, base) {
     }
 
     // 直接下载都不行时，最后再试一次"另开标签页导航"，避免占用文章页
-    if (!(download && download.ok) && pdf) {
+          // 直下被拦时（Cloudflare 只放行文档导航）：用 CDP 让浏览器导航并读响应体。
+      // 通用兜底，不按域名写死——AGU / ACS / RSC / Wiley 等同样适用。
+      if (!(download && download.ok) && candidate && !cdpTried && tab && tab.id >= 0) {
+        cdpTried = true;
+        item.detail = "直下被拦，改用浏览器导航取回…";
+        await writeBatch(state);
+        const cdp = await downloadViaCdp(tab.id, candidate, folder, "main.pdf");
+        if (cdp.ok) {
+          download = { ok: true, url: candidate };
+          pdf = candidate;
+        } else {
+          item.detail = "导航取字节失败: " + String(cdp.error).slice(0, 70);
+          await writeBatch(state);
+        }
+      }
+
+if (!(download && download.ok) && pdf) {
       try {
         const helper = await chrome.tabs.create({ url: "about:blank", active: false });
         const navigated = await downloadViaNavigation(
